@@ -7,40 +7,40 @@
 
 Run Codex from Discord DMs.
 
+`cdbot` turns Discord DMs into a remote control for Codex. You can chat with Codex, stream replies back into Discord, keep sessions alive between messages, and handle approvals without touching your terminal.
 
-`cdbot` is a lightweight bridge between Discord and the Codex app-server SDK. Send a message to the bot in a DM, and it forwards that prompt into a local Codex session, streams the response back into Discord, and keeps the thread state around for follow-up turns.
-
-It is intentionally small, local-first, and practical: one bot process, one Codex binary, one workspace, and a clean approval flow for actions that need confirmation.
+The architecture is intentionally simple: one bot process, one local Codex binary, one workspace, and a built-in approval flow for anything that needs confirmation.
 
 ![Screenshot](assets/cdbot.png)
 
-## Why this exists
+## Why?
 
-If you already use Codex locally, Discord can become a surprisingly convenient control surface:
+If you already use Codex locally, Discord ends up being a pretty handy interface:
 
-- Ask Codex to inspect or edit a repo from your phone or another machine.
-- Keep a DM thread tied to a resumable Codex session.
-- Review approval requests directly inside Discord.
-- Change the active model or working directory without access the terminal.
+- Check on a repo from your phone or another machine.
+- Keep one DM thread tied to one resumable Codex session.
+- Handle approval prompts right inside Discord.
+- Switch models or working directories without SSH-ing into anything.
 
-## Features
+## What it does
 
-- *DM-first interaction model*: Messages from Discord DMs are treated as Codex prompts.
-- *Streaming replies*: Assistant output is forwarded back to Discord as it arrives.
-- *Session Persistence & Control*: Each DM thread maps to a unique Codex session ID to maintain continuous context. Use the /clear command to terminate the current session and start a fresh one.
-- *In-chat approvals*: File changes and command execution approvals are surfaced as Discord UI buttons. Additionally, you can approve for the rest of the current turn.
-- *Remote Agent Management*: Issue `/model`, `/cwd` and other control commands to manage the remote Codex session without terminal access.
+- *DM-first workflow*: every DM message is treated as a Codex prompt.
+- *Streaming replies*: Codex output is forwarded back to Discord as it arrives.
+- *Persistent sessions*: each DM thread maps to its own Codex session, so context sticks around. Use `/clear` if you want a fresh start.
+- *In-chat approvals*: command and file-change approvals show up as Discord UI buttons. You can also approve for the rest of the current turn.
+- *Remote session controls*: use `/model`, `/cwd`, and related commands to manage the session from Discord.
+- *Voice input*: send voice DMs when typing is annoying. The bot transcribes them and forwards the transcript to Codex.
 
 ![In Chat Approval](assets/in_discord_app.png)
 
-## Quick Start
+## Quick start
 
 ### Requirements
 
 - Python `3.13+`
 - `uv`
 - A working local Codex installation
-- A Discord bot token with permission to receive DMs
+- A Discord bot token
 
 ### Setup
 
@@ -49,25 +49,28 @@ git clone https://github.com/msstnk/cdbot.git
 cd cdbot
 
 git clone https://github.com/openai/codex.git vendor/codex
-uv sync --dev
+uv sync
 ```
 
+### Set up a Discord server and bot token
 
-### Prepare a Discord Server and Bot Token
+1. Create a private Discord server where you're the only member.
+   By default, the bot does not do per-user permission checks and will reply to any DM from anyone who shares a server with it.
+2. Open the Discord Developer Portal and create a new application.
+3. In the **Bot** tab, name your bot and reset the token to get `CDBOT_DISCORD_BOT_TOKEN`.
+4. In the **OAuth2** tab, enable the `bot` scope.
+   Leave all bot permissions unchecked, copy the generated URL, and open it in your browser.
 
-1. **Create a private Discord server where you are the only member**. By default, the bot does not check for user permissions and will respond to any direct message (DM) from any user who shares a server with it.
-2. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a new application.
-3. Under the "Bot" tab, name your bot and reset the token to get your `CDBOT_DISCORD_BOT_TOKEN`.
-4. Under the "OAuth2" tab, check the "bot" scope. Leave all "Bot Permissions" unselected. Copy the generated URL and paste it in your browser.
-    - *Note:* The bot only responds to DMs. You do not need to select any permissions.
+Note: the bot only responds to DMs, so it does not need any special guild permissions.
 
-### Bot Configuration
+### Configure the bot
 
 > [!IMPORTANT]
-> The bot responds to any user in the same server by default, you can restrict this with the `CDBOT_WHITELISTED_USERS` environment variable.
-> Discord user IDs will be stored in the session_store.jsonl file when session accepted or INFO+ debug logs when session rejected.
+> By default, the bot replies to any user who shares a server with it.
+> You can lock this down with `CDBOT_WHITELISTED_USERS`.
+> Discord user IDs are stored in `session_store.jsonl` for accepted sessions and in INFO-or-higher debug logs for rejected sessions.
 
-The app loads environment variables from `.env` in the project root. Create this file with the following content:
+The app reads environment variables from a `.env` file in the project root:
 
 ```bash
 cp .env.example .env
@@ -78,25 +81,34 @@ cp .env.example .env
 | `CDBOT_DISCORD_BOT_TOKEN` | Yes | - | Discord bot token. |
 | `CDBOT_CODEX_HOME` | No | `.codex` | Codex home directory passed to the runtime. |
 | `CDBOT_CODEX_BIN` | No | `.codex/bin/codex` | Path to the local Codex binary. Must exist. |
-| `CDBOT_CODEX_MODEL` | No | `gpt-5.5` | Default model used for new turns. |
-| `CDBOT_APPROVAL_TIMEOUT_SEC` | No | `60` | Timeout for approval requests before they default to deny. |
-| `CDBOT_SESSION_STORE_PATH` | No | `.local/session_store.jsonl` | JSONL file used to persist DM session state, including the Discord user id for the DM. |
+| `CDBOT_CODEX_MODEL` | No | `gpt-5.5` | Default model for new turns. |
+| `CDBOT_ENABLE_VOICE_CONTROL` | No | `false` | Enables voice-message transcription in Discord DMs. |
+| `OPENAI_API_KEY` | No | empty | Required if you want voice-message transcription. |
+| `CDBOT_OPENAI_TRANSCRIPTION_MODEL` | No | `whisper-1` | OpenAI transcription model used for voice messages. |
+| `CDBOT_APPROVAL_TIMEOUT_SEC` | No | `60` | How long approval requests wait before defaulting to deny. |
+| `CDBOT_SESSION_STORE_PATH` | No | `.local/session_store.jsonl` | JSONL file used to persist DM session state, including the Discord user ID tied to the DM. |
 | `CDBOT_WORKSPACE_CWD` | No | current process directory | Root workspace directory for Codex turns. |
-| `CDBOT_WHITELISTED_USERS` | No | empty | Comma-separated Discord user ids allowed to use the bot. Empty means allow all users who can DM the bot. |
-| `CDBOT_LOCALE` | No | `en_US` | Bot message locale. Bundled: `en_US`, `ja_JP`. |
+| `CDBOT_WHITELISTED_USERS` | No | empty | Comma-separated Discord user IDs allowed to use the bot. Empty means any user who can DM the bot is allowed. |
+| `CDBOT_LOCALE` | No | `en_US` | Bot message locale. Bundled locales: `en_US`, `ja_JP`. |
 | `CDBOT_DEBUG_LEVEL` | No | `OFF` | Debug log level: `OFF`, `ERROR`, `WARNING`, `INFO`, `DEBUG`, `TRACE`. |
-| `CDBOT_DEBUG_LOG_PATH` | No | `.local/cdbot.log` | Debug log output path. |
+| `CDBOT_DEBUG_LOG_PATH` | No | `.local/cdbot.log` | Path to the debug log file. |
+
+### Enable voice input
+
+Set `CDBOT_ENABLE_VOICE_CONTROL=true` and provide `OPENAI_API_KEY`.
+When voice input is enabled, the bot transcribes incoming Discord voice messages and forwards the transcript to Codex.
 
 ### Run the bot
-Run the bot simply with:
+
+Start it with:
 
 ```bash
 uv run main.py
 ```
 
-or create a systemd service file like:
+If you want to keep it running as a service, something like this works with `systemd`:
 
-```ini cdbot.service
+```ini
 [Unit]
 Description=cdbot service
 After=network.target
@@ -112,25 +124,25 @@ Restart=never
 WantedBy=multi-user.target
 ```
 
+## DM commands
 
-## DM Commands
-
-These are regular DM messages, not Discord slash-command registrations.
+These are plain DM messages, not registered Discord slash commands.
 
 | Command | Description |
 | --- | --- |
-| `/clear` | Forget the saved Codex thread for the current DM while keeping per-DM settings like `cwd` and `model`. |
-| `/cwd` | Show the current working directory for this DM. |
-| `/cwd <path>` | Change the working directory for future turns. The path must stay inside the configured workspace root. |
-| `/model` | Show the currently selected model. |
-| `/model <name>` | Change the model and clear the session. |
+| `/clear` | Clears the saved Codex thread for the current DM while keeping per-DM settings like `cwd` and `model`. |
+| `/cwd` | Shows the current working directory for this DM. |
+| `/cwd <path>` | Changes the working directory for future turns. The path must stay inside the configured workspace root. |
+| `/model` | Shows the currently selected model. |
+| `/model <name>` | Changes the model and clears the current session. |
 
 ## Notes
 
-- The bot only responds to direct messages, not guild channels.
-- Working directory changes are intentionally constrained to the configured workspace root.
-- `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` may be required on Ubuntu 24.04 to allow Codex to run bubblewrapped commands without errors, see [Codex issue#17337](https://github.com/openai/codex/issues/17337#issuecomment-4322840642) and [Codex issue#14919](https://github.com/openai/codex/issues/14919)
+- The bot only responds to direct messages, not server channels.
+- Working directory changes are intentionally limited to the configured workspace root.
+- Voice messages are not treated as control commands like `/clear`, `/cwd`, or `/model`.
+- On Ubuntu 24.04, you may need `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` so Codex can run bubblewrapped commands without errors. See [Codex issue #17337](https://github.com/openai/codex/issues/17337#issuecomment-4322840642) and [Codex issue #14919](https://github.com/openai/codex/issues/14919).
 
 ## License
 
-This project is licensed under the Apache License, Version 2.0.
+Licensed under the Apache License, Version 2.0.
