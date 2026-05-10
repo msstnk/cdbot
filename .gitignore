@@ -1,0 +1,9 @@
+/.*
+!/.gitignore
+!/.env.example
+!/.python-version
+__pycache__
+*.pyc
+
+/vendor/*
+!/vendor/.gitkeep
