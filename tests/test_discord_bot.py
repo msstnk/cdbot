@@ -11,7 +11,14 @@ import discord
 import pytest
 
 from bot.codex_runner import TurnResult
-from bot.config import CodexSettings, DebugSettings, LocaleSettings, Settings, StorageSettings
+from bot.config import (
+    CodexSettings,
+    DebugSettings,
+    LocaleSettings,
+    OpenAISettings,
+    Settings,
+    StorageSettings,
+)
 from bot.conversation_state import ActiveTurn
 from bot.debug_logging import configure_debug_logger
 from bot.discord_bot import CodexDiscordBot
@@ -64,12 +71,37 @@ class DummyChannel:
         self.id = 123
 
 
+class DummyVoiceAttachment:
+    # pylint: disable=too-many-arguments
+    def __init__(
+        self,
+        *,
+        filename: str = "voice.ogg",
+        content_type: str = "audio/ogg",
+        payload: bytes = b"voice",
+        attachment_id: int = 999,
+        size: int | None = None,
+    ) -> None:
+        self.filename = filename
+        self.content_type = content_type
+        self.id = attachment_id
+        self.size = len(payload) if size is None else size
+        self._payload = payload
+
+    def is_voice_message(self) -> bool:
+        return True
+
+    async def read(self) -> bytes:
+        return self._payload
+
+
 class DummyMessage:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str, *, attachments: list[Any] | None = None) -> None:
         self.content = content
         self.author = DummyAuthor()
         self.channel = DummyChannel()
         self.guild = None
+        self.attachments = attachments or []
         self.replies: list[str] = []
 
     async def reply(self, content: str, *, mention_author: bool = False) -> None:
@@ -92,6 +124,39 @@ class FakeRunner:
             assistant_text="",
             resumed=False,
         )
+
+
+class FakeCapturingRunner:
+    def __init__(self) -> None:
+        self.request: object | None = None
+
+    async def run_turn(self, request: object, active_turn: object, on_block: object) -> TurnResult:
+        _ = (active_turn, on_block)
+        self.request = request
+        return TurnResult(
+            thread_id="thread-new",
+            turn_id="turn-1",
+            status="completed",
+            assistant_text="",
+            resumed=False,
+        )
+
+
+class FakeVoiceTranscriber:
+    def __init__(
+        self,
+        transcript: str = "hello from voice",
+        error: Exception | None = None,
+    ) -> None:
+        self._error = error
+        self._transcript = transcript
+        self.attachments: list[Any] = []
+
+    async def transcribe_attachment(self, attachment: object) -> str:
+        self.attachments.append(attachment)
+        if self._error is not None:
+            raise self._error
+        return self._transcript
 
 
 def _change_model_and_clear_session(
@@ -169,6 +234,83 @@ async def test_on_message_persists_discord_user_id(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_on_message_uses_voice_message_transcript(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace, enable_voice_control=True))
+    bot._voice_transcriber = cast(Any, FakeVoiceTranscriber("transcribed voice"))
+    runner = FakeCapturingRunner()
+    bot._runner = cast(Any, runner)
+    message = DummyMessage("", attachments=[DummyVoiceAttachment()])
+
+    await bot.on_message(cast(discord.Message, message))
+    active_turn = await bot._conversation_state.get("dm:123")
+    assert active_turn is not None and active_turn.task is not None
+    await active_turn.task
+
+    request = cast(Any, runner.request)
+    assert request.prompt == "[Voice message transcript]\ntranscribed voice"
+    assert not message.replies
+
+
+@pytest.mark.asyncio
+async def test_on_message_combines_voice_transcript_and_text(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace, enable_voice_control=True))
+    bot._voice_transcriber = cast(Any, FakeVoiceTranscriber("transcribed voice"))
+    voice_attachment = DummyVoiceAttachment()
+
+    prompt = await bot._build_prompt(
+        cast(discord.Message, DummyMessage("please summarize", attachments=[voice_attachment])),
+        cast(discord.Attachment, voice_attachment),
+    )
+
+    assert prompt == (
+        "[Voice message transcript]\ntranscribed voice\n\n[User text]\nplease summarize"
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_message_replies_when_voice_control_is_disabled(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace))
+    message = DummyMessage("", attachments=[DummyVoiceAttachment()])
+
+    await bot.on_message(cast(discord.Message, message))
+
+    assert message.replies == [_messages().text("discord.voice_control_disabled")]
+
+
+@pytest.mark.asyncio
+async def test_on_message_replies_when_voice_transcription_is_unconfigured(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace, enable_voice_control=True))
+    message = DummyMessage("", attachments=[DummyVoiceAttachment()])
+
+    await bot.on_message(cast(discord.Message, message))
+
+    assert message.replies == [_messages().text("discord.voice_not_configured")]
+
+
+@pytest.mark.asyncio
+async def test_on_message_replies_when_voice_transcription_fails(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace, enable_voice_control=True))
+    bot._voice_transcriber = cast(Any, FakeVoiceTranscriber(error=RuntimeError("boom")))
+    message = DummyMessage("", attachments=[DummyVoiceAttachment()])
+
+    await bot.on_message(cast(discord.Message, message))
+
+    assert message.replies == [
+        _messages().format("discord.voice_transcription_failed", error_text="boom")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_on_message_rejects_non_whitelisted_user(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
@@ -177,8 +319,61 @@ async def test_on_message_rejects_non_whitelisted_user(tmp_path: Path) -> None:
 
     await bot.on_message(cast(discord.Message, message))
 
-    assert message.replies == [_messages().text("discord.user_not_allowed")]
+    assert message.replies == [
+        _messages().format("discord.user_not_allowed", user_id=1)
+    ]
     assert bot._session_store.get_discord_user_id("dm:123") == 0
+
+
+@pytest.mark.asyncio
+async def test_on_message_rejects_non_whitelisted_voice_user_before_transcription(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(
+        _settings(tmp_path, workspace, whitelisted_users={999}, enable_voice_control=True)
+    )
+    transcriber = FakeVoiceTranscriber("transcribed voice")
+    bot._voice_transcriber = cast(Any, transcriber)
+    message = DummyMessage("", attachments=[DummyVoiceAttachment()])
+
+    await bot.on_message(cast(discord.Message, message))
+
+    assert message.replies == [
+        _messages().format("discord.user_not_allowed", user_id=1)
+    ]
+    assert not transcriber.attachments
+
+
+@pytest.mark.asyncio
+async def test_on_message_does_not_execute_clear_command_for_voice_message(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace, enable_voice_control=True))
+    bot._voice_transcriber = cast(Any, FakeVoiceTranscriber("transcribed voice"))
+    runner = FakeCapturingRunner()
+    bot._runner = cast(Any, runner)
+    conversation_key = "dm:123"
+    bot._session_store.save_session(
+        conversation_key,
+        session_id="thread-1",
+        session_model="gpt-5.5",
+        session_cwd=str(workspace),
+    )
+    message = DummyMessage("/clear", attachments=[DummyVoiceAttachment()])
+
+    await bot.on_message(cast(discord.Message, message))
+    active_turn = await bot._conversation_state.get(conversation_key)
+    assert active_turn is not None and active_turn.task is not None
+    await active_turn.task
+
+    request = cast(Any, runner.request)
+    assert request.prompt == "[Voice message transcript]\ntranscribed voice\n\n[User text]\n/clear"
+    assert bot._session_store.get_session_id(conversation_key) == "thread-new"
+    assert not message.replies
 
 
 @pytest.mark.asyncio
@@ -248,6 +443,7 @@ def _settings(
     workspace: Path,
     *,
     whitelisted_users: set[int] | frozenset[int] = frozenset(),
+    enable_voice_control: bool = False,
 ) -> Settings:
     codex_bin = tmp_path / "codex"
     codex_bin.write_text("", encoding="utf-8")
@@ -259,6 +455,11 @@ def _settings(
             home_path=tmp_path / ".codex",
             default_model="gpt-5.5",
             workspace_cwd=str(workspace.resolve()),
+        ),
+        openai=OpenAISettings(
+            enable_voice_control=enable_voice_control,
+            api_key="",
+            transcription_model="whisper-1",
         ),
         approval_timeout_sec=60.0,
         storage=StorageSettings(

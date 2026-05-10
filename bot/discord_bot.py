@@ -8,6 +8,7 @@ from pathlib import Path
 import discord
 
 from .approval_router import ApprovalRouter
+from .audio_transcriber import OpenAIVoiceTranscriber
 from .codex_runner import (
     CodexRunner,
     RunnerDependencies,
@@ -75,7 +76,7 @@ class DiscordReplyStream:
             self._messages.append(sent)
 
 
-class CodexDiscordBot(discord.Client):
+class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attributes
     """Discord DM client that forwards prompts to a Codex runner."""
 
     def __init__(self, settings: Settings) -> None:
@@ -95,6 +96,12 @@ class CodexDiscordBot(discord.Client):
         )
         self._logger = get_logger()
         self._runner: CodexRunner | None = None
+        self._voice_transcriber: OpenAIVoiceTranscriber | None = None
+        if settings.openai.enable_voice_control and settings.openai.api_key:
+            self._voice_transcriber = OpenAIVoiceTranscriber(
+                api_key=settings.openai.api_key,
+                model=settings.openai.transcription_model,
+            )
 
     async def setup_hook(self) -> None:
         """Create the Codex runner once Discord has an event loop."""
@@ -128,15 +135,13 @@ class CodexDiscordBot(discord.Client):
             return
 
         self._logger.debug(
-            "discord.dm.received message=%r dm_id=%s user_id=%s",
+            "discord.dm.received message=%r dm_id=%s user_id=%s attachments=%s",
             message.content,
             message.channel.id,
             message.author.id,
+            len(message.attachments),
         )
         content = message.content.strip()
-        if not content:
-            return
-
         conversation_key = f"dm:{message.channel.id}"
         if not self._is_whitelisted_user(message.author.id):
             self._logger.info(
@@ -145,19 +150,27 @@ class CodexDiscordBot(discord.Client):
                 message.author.id,
             )
             await message.reply(
-                self._messages.text("discord.user_not_allowed"),
+                self._messages.format(
+                    "discord.user_not_allowed",
+                    user_id=message.author.id,
+                ),
                 mention_author=False,
             )
         else:
+            voice_attachment = self._voice_attachment(message.attachments)
+            prompt = await self._build_prompt(message, voice_attachment)
+            if prompt is None:
+                return
+
             self._session_store.set_discord_user_id(conversation_key, message.author.id)
-            if content == "/clear":
+            if voice_attachment is None and content == "/clear":
                 await self._handle_clear(message, conversation_key)
-            elif content.startswith("/cwd"):
+            elif voice_attachment is None and prompt.startswith("/cwd"):
                 await self._handle_cwd(message, conversation_key)
-            elif content.startswith("/model"):
+            elif voice_attachment is None and prompt.startswith("/model"):
                 await self._handle_model(message, conversation_key)
             else:
-                await self._handle_prompt(message, conversation_key, content)
+                await self._handle_prompt(message, conversation_key, prompt)
 
     async def _handle_clear(
         self,
@@ -348,3 +361,84 @@ class CodexDiscordBot(discord.Client):
         except ValueError:
             return None
         return str(resolved)
+
+    async def _build_prompt(
+        self,
+        message: discord.Message,
+        voice_attachment: discord.Attachment | None,
+    ) -> str | None:
+        content = message.content.strip()
+        if voice_attachment is None:
+            return content or None
+
+        transcriber = self._voice_transcriber
+        if transcriber is None:
+            self._logger.debug(
+                "discord.voice.unavailable dm_id=%s user_id=%s enabled=%s",
+                message.channel.id,
+                message.author.id,
+                self._settings.openai.enable_voice_control,
+            )
+            if self._settings.openai.enable_voice_control:
+                await message.reply(
+                    self._messages.text("discord.voice_not_configured"),
+                    mention_author=False,
+                )
+            else:
+                await message.reply(
+                    self._messages.text("discord.voice_control_disabled"),
+                    mention_author=False,
+                )
+            return None
+
+        self._logger.debug(
+            "discord.voice.detected dm_id=%s user_id=%s attachment_id=%s filename=%s",
+            message.channel.id,
+            message.author.id,
+            voice_attachment.id,
+            voice_attachment.filename,
+        )
+        try:
+            transcript = await transcriber.transcribe_attachment(voice_attachment)
+        except RuntimeError as exc:
+            self._logger.exception(
+                "discord.voice.transcription.failed dm_id=%s user_id=%s attachment_id=%s",
+                message.channel.id,
+                message.author.id,
+                voice_attachment.id,
+            )
+            await message.reply(
+                self._messages.format(
+                    "discord.voice_transcription_failed",
+                    error_text=str(exc),
+                ),
+                mention_author=False,
+            )
+            return None
+
+        if not transcript:
+            self._logger.debug(
+                "discord.voice.transcription.empty dm_id=%s user_id=%s attachment_id=%s",
+                message.channel.id,
+                message.author.id,
+                voice_attachment.id,
+            )
+            await message.reply(
+                self._messages.text("discord.voice_transcription_empty"),
+                mention_author=False,
+            )
+            return None
+
+        parts = [f"[Voice message transcript]\n{transcript}"]
+        if content:
+            parts.append(f"[User text]\n{content}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _voice_attachment(
+        attachments: list[discord.Attachment],
+    ) -> discord.Attachment | None:
+        for attachment in attachments:
+            if attachment.is_voice_message():
+                return attachment
+        return None
