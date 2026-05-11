@@ -21,7 +21,7 @@ from bot.config import (
 )
 from bot.conversation_state import ActiveTurn
 from bot.debug_logging import configure_debug_logger
-from bot.discord_bot import CodexDiscordBot
+from bot.discord_bot import CodexDiscordBot, DiscordReplyStream
 from bot.localization import DEFAULT_LOCALE, DEFAULT_LOCALES_PATH, Messages
 
 
@@ -109,6 +109,38 @@ class DummyMessage:
         self.replies.append(content)
 
 
+class DummySentMessage:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.edits: list[str] = []
+
+    async def edit(self, *, content: str) -> None:
+        self.content = content
+        self.edits.append(content)
+
+
+class DummyStreamChannel:
+    def __init__(self) -> None:
+        self.sent_messages: list[DummySentMessage] = []
+
+    async def send(self, content: str) -> DummySentMessage:
+        sent = DummySentMessage(content)
+        self.sent_messages.append(sent)
+        return sent
+
+
+class DummyStreamSourceMessage:
+    def __init__(self) -> None:
+        self.channel = DummyStreamChannel()
+        self.replies: list[DummySentMessage] = []
+
+    async def reply(self, content: str, *, mention_author: bool = False) -> DummySentMessage:
+        assert mention_author is False
+        sent = DummySentMessage(content)
+        self.replies.append(sent)
+        return sent
+
+
 class FakeRunner:
     def __init__(self, before_return: Callable[[], Any] | None = None) -> None:
         self.before_return = before_return
@@ -167,6 +199,44 @@ def _change_model_and_clear_session(
 
 
 @pytest.mark.asyncio
+async def test_reply_stream_replies_once_then_sends_remaining_chunks() -> None:
+    source = DummyStreamSourceMessage()
+    stream = DiscordReplyStream(cast(discord.Message, source), _messages())
+
+    await stream.add_block("a" * 2001)
+
+    assert [message.content for message in source.replies] == ["a" * 2000]
+    assert [message.content for message in source.channel.sent_messages] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_reply_stream_fail_edits_existing_first_message() -> None:
+    source = DummyStreamSourceMessage()
+    stream = DiscordReplyStream(cast(discord.Message, source), _messages())
+    await stream.add_block("partial")
+
+    await stream.fail("boom")
+
+    expected = _messages().format("discord.error", error_text="boom")
+    assert source.replies[0].content == expected
+    assert source.replies[0].edits == [expected]
+    assert not source.channel.sent_messages
+
+
+@pytest.mark.asyncio
+async def test_reply_stream_finalize_reports_non_success_without_output() -> None:
+    source = DummyStreamSourceMessage()
+    stream = DiscordReplyStream(cast(discord.Message, source), _messages())
+
+    await stream.finalize("", status="failed")
+
+    status_text = _messages().format("discord.turn_finished_with_status", status="failed")
+    assert [message.content for message in source.replies] == [
+        _messages().format("discord.error", error_text=status_text)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_handle_clear_replies_with_effective_model_and_cwd(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
@@ -219,6 +289,89 @@ async def test_handle_model_clears_saved_session_and_replies_with_notice(tmp_pat
     ]
     assert bot._session_store.get_session_id(conversation_key) == ""
     assert bot._session_store.get_model(conversation_key, "fallback") == "gpt-5.5"
+
+
+@pytest.mark.asyncio
+async def test_handle_model_without_argument_replies_with_current_model(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace))
+    conversation_key = "dm:123"
+    bot._session_store.set_model(conversation_key, "gpt-5.4")
+    message = DummyMessage("/model")
+
+    await bot._handle_model(cast(discord.Message, message), conversation_key)
+
+    assert message.replies == [
+        _messages().format("discord.current_model", current="gpt-5.4")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_cwd_without_argument_replies_with_current_cwd(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    target = workspace / "src"
+    target.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace))
+    conversation_key = "dm:123"
+    bot._session_store.set_cwd(conversation_key, str(target.resolve()))
+    message = DummyMessage("/cwd")
+
+    await bot._handle_cwd(cast(discord.Message, message), conversation_key)
+
+    assert message.replies == [
+        _messages().format("discord.current_cwd", current=str(target.resolve()))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_cwd_rejects_invalid_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace))
+    conversation_key = "dm:123"
+    message = DummyMessage("/cwd missing")
+
+    await bot._handle_cwd(cast(discord.Message, message), conversation_key)
+
+    assert message.replies == [_messages().text("discord.invalid_cwd")]
+    assert bot._session_store.get_cwd(conversation_key, "fallback") == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_handle_cwd_updates_to_workspace_descendant(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    target = workspace / "src"
+    target.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace))
+    conversation_key = "dm:123"
+    message = DummyMessage("/cwd src")
+
+    await bot._handle_cwd(cast(discord.Message, message), conversation_key)
+
+    assert message.replies == [
+        _messages().format("discord.cwd_updated", cwd=str(target.resolve()))
+    ]
+    assert bot._session_store.get_cwd(conversation_key, "fallback") == str(target.resolve())
+
+
+@pytest.mark.asyncio
+async def test_on_message_does_not_treat_command_prefix_as_command(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace))
+    runner = FakeCapturingRunner()
+    bot._runner = cast(Any, runner)
+    message = DummyMessage("/modelx")
+
+    await bot.on_message(cast(discord.Message, message))
+    active_turn = await bot._conversation_state.get("dm:123")
+    assert active_turn is not None and active_turn.task is not None
+    await active_turn.task
+
+    request = cast(Any, runner.request)
+    assert request.prompt == "/modelx"
+    assert not message.replies
 
 
 @pytest.mark.asyncio

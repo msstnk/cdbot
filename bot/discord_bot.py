@@ -165,9 +165,9 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
             self._session_store.set_discord_user_id(conversation_key, message.author.id)
             if voice_attachment is None and content == "/clear":
                 await self._handle_clear(message, conversation_key)
-            elif voice_attachment is None and prompt.startswith("/cwd"):
+            elif voice_attachment is None and _matches_command(prompt, "/cwd"):
                 await self._handle_cwd(message, conversation_key)
-            elif voice_attachment is None and prompt.startswith("/model"):
+            elif voice_attachment is None and _matches_command(prompt, "/model"):
                 await self._handle_model(message, conversation_key)
             else:
                 await self._handle_prompt(message, conversation_key, prompt)
@@ -442,3 +442,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
             if attachment.is_voice_message():
                 return attachment
         return None
+
+
+def _matches_command(prompt: str, command: str) -> bool:
+    return prompt == command or prompt.startswith(f"{command} ")

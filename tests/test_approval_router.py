@@ -5,6 +5,7 @@ from typing import Any, cast
 import pytest
 
 from bot.approval_router import (
+    APPROVAL_INITIAL_CONTENT_LIMIT,
     TIMEOUT_REASON,
     TURN_APPROVAL_REASON,
     ApprovalDecision,
@@ -252,7 +253,7 @@ def test_format_approval_message_keeps_full_file_change_snippet_when_it_fits() -
     assert snippet in message
 
 
-def test_format_approval_message_uses_full_discord_limit_for_file_changes() -> None:
+def test_format_approval_message_reserves_result_space_for_file_changes() -> None:
     message = _format_approval_message(
         "item/fileChange/requestApproval",
         {
@@ -268,7 +269,7 @@ def test_format_approval_message_uses_full_discord_limit_for_file_changes() -> N
         _messages(),
     )
 
-    assert len(message) == DISCORD_MESSAGE_LIMIT
+    assert len(message) == APPROVAL_INITIAL_CONTENT_LIMIT
     assert _messages().text("approval.proposed_changes").split(":\n", maxsplit=1)[0] in message
     assert "```diff" in message
 
@@ -285,6 +286,37 @@ def test_approval_result_content_clips_initial_message_to_discord_limit() -> Non
     )
 
     assert len(content) == DISCORD_MESSAGE_LIMIT
+    assert content.endswith(_result_line("approval.result.approved", actor_name="alice"))
+
+
+def test_approval_result_content_preserves_file_change_code_fence() -> None:
+    message = _format_approval_message(
+        "item/fileChange/requestApproval",
+        {
+            "fileChangeFiles": ["bot/approval_router.py"],
+            "fileChangeChanges": [
+                {
+                    "path": "bot/approval_router.py",
+                    "kind": "update",
+                    "snippet": "@@ -1,2 +1,200 @@\n" + ("+print('hi')\n" * 400),
+                }
+            ],
+        },
+        _messages(),
+    )
+
+    content = _approval_result_content(
+        message,
+        ApprovalDecision(
+            decision="accept",
+            actor_name="alice",
+            resolved_at="2026-05-10T00:00:00+00:00",
+        ),
+        _messages(),
+    )
+
+    assert len(content) <= DISCORD_MESSAGE_LIMIT
+    assert content.count("```") % 2 == 0
     assert content.endswith(_result_line("approval.result.approved", actor_name="alice"))
 
 

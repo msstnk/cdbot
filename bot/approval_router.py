@@ -16,6 +16,10 @@ from .text import clip_text
 
 TURN_APPROVAL_REASON = "turn"
 TIMEOUT_REASON = "timed_out"
+APPROVAL_INITIAL_CONTENT_LIMIT = 1900
+APPROVAL_RESULT_LINE_LIMIT = (
+    DISCORD_MESSAGE_LIMIT - APPROVAL_INITIAL_CONTENT_LIMIT - len("\n\n")
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,7 +376,7 @@ def _format_approval_message(
     if details:
         sections.append(details)
 
-    return "\n\n".join(sections)
+    return clip_text("\n\n".join(sections), APPROVAL_INITIAL_CONTENT_LIMIT)
 
 
 def _now_iso() -> str:
@@ -408,6 +412,7 @@ def _approval_result_content(
     result_line = catalog.format(
         "approval.result.line", suffix=suffix, actor=actor, reason=reason
     )
+    result_line = clip_text(result_line, APPROVAL_RESULT_LINE_LIMIT)
     available_initial = DISCORD_MESSAGE_LIMIT - len("\n\n") - len(result_line)
     if available_initial <= 0:
         return clip_text(result_line, DISCORD_MESSAGE_LIMIT)
@@ -511,11 +516,13 @@ def _format_command_actions(value: object, messages: Messages) -> str:
     return "\n".join(lines)
 
 
-def _remaining_message_chars(sections: list[str]) -> int:
+def _remaining_message_chars(
+    sections: list[str], limit: int = APPROVAL_INITIAL_CONTENT_LIMIT
+) -> int:
     current = "\n\n".join(section for section in sections if section)
     if not current:
-        return DISCORD_MESSAGE_LIMIT
-    return max(0, DISCORD_MESSAGE_LIMIT - len(current) - len("\n\n"))
+        return limit
+    return max(0, limit - len(current) - len("\n\n"))
 
 
 def _format_file_change_changes(
