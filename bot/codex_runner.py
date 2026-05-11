@@ -21,7 +21,11 @@ from .approval_router import ApprovalRequest, ApprovalRouter
 from .conversation_state import ActiveTurn
 from .debug_logging import dump_for_log, get_logger, trace
 from .localization import Messages, load_default_messages
-from .text import extract_assistant_text, extract_text_blocks_from_item
+from .text import (
+    extract_assistant_text,
+    extract_last_assistant_text,
+    extract_text_blocks_from_item,
+)
 
 
 class AppServerClientProtocol(Protocol):
@@ -90,6 +94,14 @@ class TurnRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class AssistantOutputBlock:
+    """One assistant output block plus Discord streaming metadata."""
+
+    text: str
+    starts_new_message: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class TurnResult:
     """Result metadata and assistant text from one Codex turn."""
 
@@ -97,12 +109,14 @@ class TurnResult:
     turn_id: str
     status: str
     assistant_text: str
+    final_assistant_text: str
     resumed: bool
+    token_usage_last: dict[str, int]
 
 
 ApprovalHandler = Callable[[str, JsonObject | None], JsonObject]
 ClientFactory = Callable[[AppServerConfig, ApprovalHandler], AppServerClientProtocol]
-BlockHandler = Callable[[str], Coroutine[Any, Any, None]]
+BlockHandler = Callable[[AssistantOutputBlock], Coroutine[Any, Any, None]]
 FileChangePreview = dict[str, str]
 CDBOT_ENV_PREFIX = "CDBOT_"
 THREAD_RESUME_FALLBACK_ERRORS = (AppServerError, OSError, RuntimeError, ValueError)
@@ -149,10 +163,13 @@ class TurnExecutionState:
         default_factory=dict
     )
     assistant_parts: list[str] = field(default_factory=list)
+    token_usage_last: dict[str, int] = field(default_factory=dict)
     resumed: bool = False
     status: str = "unknown"
     thread_id: str = ""
     turn_id: str = ""
+    pending_output_block: AssistantOutputBlock | None = None
+    next_output_starts_new_message: bool = False
     completed_turn: object | None = None
 
 
@@ -254,6 +271,7 @@ class CodexRunner:
             self._make_approval_handler(
                 runtime.request,
                 runtime.active_turn,
+                state,
                 state.file_change_preview_by_item_id,
             ),
         )
@@ -280,6 +298,11 @@ class CodexRunner:
             "".join(state.assistant_parts)
             or extract_assistant_text(state.completed_turn)
         )
+        final_assistant_text = (
+            state.pending_output_block.text
+            if state.pending_output_block is not None
+            else extract_last_assistant_text(state.completed_turn)
+        )
         self._logger.debug(
             (
                 "turn.run.result conversation_key=%s thread_id=%s "
@@ -296,7 +319,9 @@ class CodexRunner:
             turn_id=state.turn_id,
             status=state.status,
             assistant_text=assistant_text,
+            final_assistant_text=final_assistant_text,
             resumed=state.resumed,
+            token_usage_last=dict(state.token_usage_last),
         )
 
     def _log_turn_start(self, request: TurnRequest) -> None:
@@ -480,6 +505,12 @@ class CodexRunner:
             dump_for_log(payload),
         )
 
+        if method == "thread/tokenUsage/updated":
+            token_usage_last = _extract_token_usage_last(payload)
+            if token_usage_last:
+                state.token_usage_last = token_usage_last
+            return False
+
         if method == "item/started" and getattr(payload, "turn_id", "") == state.turn_id:
             item = getattr(payload, "item", None)
             item_id = _extract_thread_item_id(item)
@@ -520,19 +551,30 @@ class CodexRunner:
         runtime: TurnRuntime,
         state: TurnExecutionState,
     ) -> None:
-        blocks = extract_text_blocks_from_item(getattr(payload, "item", None))
-        for block in blocks:
-            state.assistant_parts.append(block)
-            if not runtime.active_turn.discard_output:
-                self._run_coroutine(runtime.on_block(block))
+        text = "".join(extract_text_blocks_from_item(getattr(payload, "item", None)))
+        if not text:
+            return
+
+        state.assistant_parts.append(text)
+        completed_block = AssistantOutputBlock(
+            text=text,
+            starts_new_message=state.next_output_starts_new_message,
+        )
+        state.next_output_starts_new_message = False
+
+        if state.pending_output_block is not None and not runtime.active_turn.discard_output:
+            self._run_coroutine(runtime.on_block(state.pending_output_block))
+        state.pending_output_block = completed_block
 
     def _make_approval_handler(
         self,
         request: TurnRequest,
         active_turn: ActiveTurn,
+        state: TurnExecutionState,
         file_change_preview_by_item_id: dict[str, list[FileChangePreview]],
     ) -> ApprovalHandler:
         def approval_handler(method: str, params: JsonObject | None) -> JsonObject:
+            state.next_output_starts_new_message = True
             approval_params = dict(params or {})
             if method == "item/fileChange/requestApproval":
                 approval_item_id = _extract_file_change_item_id(approval_params)
@@ -676,3 +718,46 @@ def _thread_item_payload(item: object) -> object:
     if callable(model_dump):
         return model_dump(mode="json")
     return item
+
+
+def _extract_token_usage_last(payload: object) -> dict[str, int]:
+    token_usage = _payload_value(payload, "token_usage", "tokenUsage")
+    total = _payload_value(token_usage, "total")
+    return _normalize_token_usage(total)
+
+
+def _normalize_token_usage(usage_last: object) -> dict[str, int]:
+    cached_input = _int_payload_value(usage_last, "cached_input_tokens", "cachedInputTokens")
+    input_tokens = _int_payload_value(usage_last, "input_tokens", "inputTokens")
+    output_tokens = _int_payload_value(usage_last, "output_tokens", "outputTokens")
+    total_tokens = _int_payload_value(usage_last, "total_tokens", "totalTokens")
+    if total_tokens <= 0:
+        total_tokens = max(input_tokens, cached_input) + output_tokens
+    if cached_input <= 0 and input_tokens <= 0 and output_tokens <= 0 and total_tokens <= 0:
+        return {}
+    return {
+        "cached_input_tokens": cached_input,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _int_payload_value(payload: object, *keys: str) -> int:
+    value = _payload_value(payload, *keys)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _payload_value(payload: object, *keys: str) -> object:
+    if payload is None:
+        return None
+    for key in keys:
+        if isinstance(payload, dict) and key in payload:
+            return payload[key]
+        attr = getattr(payload, key, None)
+        if attr is not None:
+            return attr
+    return None

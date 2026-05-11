@@ -10,7 +10,7 @@ from typing import Any, cast
 import discord
 import pytest
 
-from bot.codex_runner import TurnResult
+from bot.codex_runner import AssistantOutputBlock, TurnResult
 from bot.config import (
     CodexSettings,
     DebugSettings,
@@ -21,7 +21,7 @@ from bot.config import (
 )
 from bot.conversation_state import ActiveTurn
 from bot.debug_logging import configure_debug_logger
-from bot.discord_bot import CodexDiscordBot, DiscordReplyStream
+from bot.discord_bot import CodexDiscordBot, DiscordReplyStream, _format_token_usage_text
 from bot.localization import DEFAULT_LOCALE, DEFAULT_LOCALES_PATH, Messages
 
 
@@ -60,6 +60,23 @@ def test_resolve_cwd_rejects_absolute_path_outside_workspace(tmp_path: Path) -> 
     assert resolved is None
 
 
+def test_format_token_usage_text_uses_subtext_and_m_suffix_for_six_figures() -> None:
+    formatted = _format_token_usage_text(
+        _messages(),
+        {
+            "cached_input_tokens": 1_300_000,
+            "input_tokens": 1_400_000,
+            "output_tokens": 10_500,
+            "total_tokens": 1_410_500,
+        },
+    )
+
+    assert (
+        formatted
+        == "-# *Token usage for this session - 0.1M uncached + 1.3M cached input, 10.5k output*"
+    )
+
+
 class DummyAuthor:
     def __init__(self) -> None:
         self.bot = False
@@ -69,6 +86,22 @@ class DummyAuthor:
 class DummyChannel:
     def __init__(self) -> None:
         self.id = 123
+        self.sent_messages: list[Any] = []
+
+    async def send(self, content: str) -> Any:
+        self.sent_messages.append(content)
+        return content
+
+
+class DummyTurnChannel(DummyChannel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent_messages: list[DummySentMessage] = []
+
+    async def send(self, content: str) -> "DummySentMessage":
+        sent = DummySentMessage(content)
+        self.sent_messages.append(sent)
+        return sent
 
 
 class DummyVoiceAttachment:
@@ -141,9 +174,37 @@ class DummyStreamSourceMessage:
         return sent
 
 
+class DummyTurnMessage(DummyMessage):
+    def __init__(self, content: str) -> None:
+        super().__init__(content)
+        self.channel = DummyTurnChannel()
+        self.reply_messages: list[DummySentMessage] = []
+
+    async def reply(
+        self, content: str, *, mention_author: bool = False
+    ) -> DummySentMessage:
+        assert mention_author is False
+        self.replies.append(content)
+        sent = DummySentMessage(content)
+        self.reply_messages.append(sent)
+        return sent
+
+
 class FakeRunner:
-    def __init__(self, before_return: Callable[[], Any] | None = None) -> None:
+    def __init__(
+        self,
+        before_return: Callable[[], Any] | None = None,
+        *,
+        assistant_text: str = "",
+        final_assistant_text: str | None = None,
+        token_usage_last: dict[str, int] | None = None,
+    ) -> None:
         self.before_return = before_return
+        self.assistant_text = assistant_text
+        self.final_assistant_text = (
+            assistant_text if final_assistant_text is None else final_assistant_text
+        )
+        self.token_usage_last = token_usage_last or {}
 
     async def run_turn(self, request: object, active_turn: object, on_block: object) -> TurnResult:
         _ = (request, active_turn, on_block)
@@ -153,8 +214,10 @@ class FakeRunner:
             thread_id="thread-new",
             turn_id="turn-1",
             status="completed",
-            assistant_text="",
+            assistant_text=self.assistant_text,
+            final_assistant_text=self.final_assistant_text,
             resumed=False,
+            token_usage_last=dict(self.token_usage_last),
         )
 
 
@@ -170,7 +233,30 @@ class FakeCapturingRunner:
             turn_id="turn-1",
             status="completed",
             assistant_text="",
+            final_assistant_text="",
             resumed=False,
+            token_usage_last={},
+        )
+
+
+class FakeStreamingRunner:
+    async def run_turn(self, request: object, active_turn: object, on_block: object) -> TurnResult:
+        _ = (request, active_turn)
+        await cast(Any, on_block)(AssistantOutputBlock(text="first"))
+        await cast(Any, on_block)(AssistantOutputBlock(text="second"))
+        return TurnResult(
+            thread_id="thread-new",
+            turn_id="turn-1",
+            status="completed",
+            assistant_text="firstsecondfinal",
+            final_assistant_text="final",
+            resumed=False,
+            token_usage_last={
+                "cached_input_tokens": 0,
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "total_tokens": 1200,
+            },
         )
 
 
@@ -199,28 +285,28 @@ def _change_model_and_clear_session(
 
 
 @pytest.mark.asyncio
-async def test_reply_stream_replies_once_then_sends_remaining_chunks() -> None:
+async def test_reply_stream_sends_all_chunks_to_channel() -> None:
     source = DummyStreamSourceMessage()
     stream = DiscordReplyStream(cast(discord.Message, source), _messages())
 
-    await stream.add_block("a" * 2001)
+    await stream.add_block(AssistantOutputBlock(text="a" * 2001))
 
-    assert [message.content for message in source.replies] == ["a" * 2000]
-    assert [message.content for message in source.channel.sent_messages] == ["a"]
+    assert not source.replies
+    assert [message.content for message in source.channel.sent_messages] == ["a" * 2000, "a"]
 
 
 @pytest.mark.asyncio
 async def test_reply_stream_fail_edits_existing_first_message() -> None:
     source = DummyStreamSourceMessage()
     stream = DiscordReplyStream(cast(discord.Message, source), _messages())
-    await stream.add_block("partial")
+    await stream.add_block(AssistantOutputBlock(text="partial"))
 
     await stream.fail("boom")
 
     expected = _messages().format("discord.error", error_text="boom")
-    assert source.replies[0].content == expected
-    assert source.replies[0].edits == [expected]
-    assert not source.channel.sent_messages
+    assert source.channel.sent_messages[0].content == expected
+    assert source.channel.sent_messages[0].edits == [expected]
+    assert len(source.channel.sent_messages) == 1
 
 
 @pytest.mark.asyncio
@@ -231,8 +317,49 @@ async def test_reply_stream_finalize_reports_non_success_without_output() -> Non
     await stream.finalize("", status="failed")
 
     status_text = _messages().format("discord.turn_finished_with_status", status="failed")
-    assert [message.content for message in source.replies] == [
+    assert [message.content for message in source.channel.sent_messages] == [
         _messages().format("discord.error", error_text=status_text)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reply_stream_append_tail_edits_last_message_when_it_fits() -> None:
+    source = DummyStreamSourceMessage()
+    stream = DiscordReplyStream(cast(discord.Message, source), _messages())
+    await stream.add_block(AssistantOutputBlock(text="assistant reply"))
+
+    await stream.add_block(AssistantOutputBlock(text="tail"))
+
+    assert [message.content for message in source.channel.sent_messages] == [
+        "assistant reply\n\ntail"
+    ]
+    assert source.channel.sent_messages[0].edits == ["assistant reply\n\ntail"]
+
+
+@pytest.mark.asyncio
+async def test_reply_stream_append_tail_sends_new_message_when_last_chunk_is_full() -> None:
+    source = DummyStreamSourceMessage()
+    stream = DiscordReplyStream(cast(discord.Message, source), _messages())
+    await stream.add_block(AssistantOutputBlock(text="a" * 2000))
+
+    await stream.add_block(AssistantOutputBlock(text="tail"))
+
+    assert [message.content for message in source.channel.sent_messages] == ["a" * 2000, "tail"]
+
+
+@pytest.mark.asyncio
+async def test_reply_stream_starts_new_message_after_approval_boundary() -> None:
+    source = DummyStreamSourceMessage()
+    stream = DiscordReplyStream(cast(discord.Message, source), _messages())
+
+    await stream.add_block(AssistantOutputBlock(text="before approval"))
+    await stream.add_block(
+        AssistantOutputBlock(text="after approval", starts_new_message=True)
+    )
+
+    assert [message.content for message in source.channel.sent_messages] == [
+        "before approval",
+        "after approval",
     ]
 
 
@@ -254,7 +381,7 @@ async def test_handle_clear_replies_with_effective_model_and_cwd(tmp_path: Path)
 
     await bot._handle_clear(cast(discord.Message, message), conversation_key)
 
-    assert message.replies == [
+    assert message.channel.sent_messages == [
         _messages().format(
             "discord.session_cleared",
             model="gpt-5.5",
@@ -284,7 +411,7 @@ async def test_handle_model_clears_saved_session_and_replies_with_notice(tmp_pat
 
     await bot._handle_model(cast(discord.Message, message), conversation_key)
 
-    assert message.replies == [
+    assert message.channel.sent_messages == [
         _messages().format("discord.model_updated_with_clear", model="gpt-5.5")
     ]
     assert bot._session_store.get_session_id(conversation_key) == ""
@@ -302,7 +429,7 @@ async def test_handle_model_without_argument_replies_with_current_model(tmp_path
 
     await bot._handle_model(cast(discord.Message, message), conversation_key)
 
-    assert message.replies == [
+    assert message.channel.sent_messages == [
         _messages().format("discord.current_model", current="gpt-5.4")
     ]
 
@@ -319,7 +446,7 @@ async def test_handle_cwd_without_argument_replies_with_current_cwd(tmp_path: Pa
 
     await bot._handle_cwd(cast(discord.Message, message), conversation_key)
 
-    assert message.replies == [
+    assert message.channel.sent_messages == [
         _messages().format("discord.current_cwd", current=str(target.resolve()))
     ]
 
@@ -334,7 +461,7 @@ async def test_handle_cwd_rejects_invalid_path(tmp_path: Path) -> None:
 
     await bot._handle_cwd(cast(discord.Message, message), conversation_key)
 
-    assert message.replies == [_messages().text("discord.invalid_cwd")]
+    assert message.channel.sent_messages == [_messages().text("discord.invalid_cwd")]
     assert bot._session_store.get_cwd(conversation_key, "fallback") == "fallback"
 
 
@@ -349,7 +476,7 @@ async def test_handle_cwd_updates_to_workspace_descendant(tmp_path: Path) -> Non
 
     await bot._handle_cwd(cast(discord.Message, message), conversation_key)
 
-    assert message.replies == [
+    assert message.channel.sent_messages == [
         _messages().format("discord.cwd_updated", cwd=str(target.resolve()))
     ]
     assert bot._session_store.get_cwd(conversation_key, "fallback") == str(target.resolve())
@@ -433,7 +560,7 @@ async def test_on_message_replies_when_voice_control_is_disabled(tmp_path: Path)
 
     await bot.on_message(cast(discord.Message, message))
 
-    assert message.replies == [_messages().text("discord.voice_control_disabled")]
+    assert message.channel.sent_messages == [_messages().text("discord.voice_control_disabled")]
 
 
 @pytest.mark.asyncio
@@ -445,7 +572,7 @@ async def test_on_message_replies_when_voice_transcription_is_unconfigured(tmp_p
 
     await bot.on_message(cast(discord.Message, message))
 
-    assert message.replies == [_messages().text("discord.voice_not_configured")]
+    assert message.channel.sent_messages == [_messages().text("discord.voice_not_configured")]
 
 
 @pytest.mark.asyncio
@@ -458,7 +585,7 @@ async def test_on_message_replies_when_voice_transcription_fails(tmp_path: Path)
 
     await bot.on_message(cast(discord.Message, message))
 
-    assert message.replies == [
+    assert message.channel.sent_messages == [
         _messages().format("discord.voice_transcription_failed", error_text="boom")
     ]
 
@@ -472,7 +599,7 @@ async def test_on_message_rejects_non_whitelisted_user(tmp_path: Path) -> None:
 
     await bot.on_message(cast(discord.Message, message))
 
-    assert message.replies == [
+    assert message.channel.sent_messages == [
         _messages().format("discord.user_not_allowed", user_id=1)
     ]
     assert bot._session_store.get_discord_user_id("dm:123") == 0
@@ -493,7 +620,7 @@ async def test_on_message_rejects_non_whitelisted_voice_user_before_transcriptio
 
     await bot.on_message(cast(discord.Message, message))
 
-    assert message.replies == [
+    assert message.channel.sent_messages == [
         _messages().format("discord.user_not_allowed", user_id=1)
     ]
     assert not transcriber.attachments
@@ -589,6 +716,50 @@ async def test_run_turn_does_not_restore_old_session_after_model_change(tmp_path
 
     assert bot._session_store.get_session_id(conversation_key) == ""
     assert bot._session_store.get_model(conversation_key, "fallback") == "gpt-5.5"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_appends_token_usage_message(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace))
+    bot._runner = cast(
+        Any,
+        FakeRunner(
+            assistant_text="assistant reply",
+            token_usage_last={
+                "cached_input_tokens": 8000,
+                "input_tokens": 12000,
+                "output_tokens": 5000,
+                "total_tokens": 17000,
+            },
+        ),
+    )
+    active_turn = ActiveTurn(conversation_key="dm:123")
+    message = DummyTurnMessage("hello")
+
+    await bot._run_turn(cast(discord.Message, message), active_turn, "hello")
+
+    assert [sent.content for sent in message.channel.sent_messages] == [
+        "assistant reply\n\n-# *Token usage for this session - 4.0k uncached + 8.0k cached input, 5.0k output*"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_sends_intermediate_and_final_messages_separately(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    bot = CodexDiscordBot(_settings(tmp_path, workspace))
+    bot._runner = cast(Any, FakeStreamingRunner())
+    active_turn = ActiveTurn(conversation_key="dm:123")
+    message = DummyTurnMessage("hello")
+
+    await bot._run_turn(cast(discord.Message, message), active_turn, "hello")
+
+    assert [sent.content for sent in message.channel.sent_messages] == [
+        "first\n\nsecond",
+        "final\n\n-# *Token usage for this session - 1.0k uncached + 0 cached input, 200 output*",
+    ]
 
 
 def _settings(

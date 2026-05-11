@@ -10,6 +10,7 @@ import discord
 from .approval_router import ApprovalRouter
 from .audio_transcriber import OpenAIVoiceTranscriber
 from .codex_runner import (
+    AssistantOutputBlock,
     CodexRunner,
     RunnerDependencies,
     RunnerEnvironment,
@@ -26,7 +27,7 @@ from .text import split_discord_text
 
 
 class DiscordReplyStream:
-    """Append Codex output blocks to one Discord reply thread."""
+    """Append Codex output blocks to the source DM channel."""
 
     def __init__(self, source_message: discord.Message, messages: Messages) -> None:
         self._source_message = source_message
@@ -34,29 +35,56 @@ class DiscordReplyStream:
         self._messages: list[discord.Message] = []
         self._lock = asyncio.Lock()
 
-    async def add_block(self, block: str) -> None:
-        """Send one assistant output block, splitting it for Discord limits."""
-        chunks = split_discord_text(block, DISCORD_MESSAGE_LIMIT)
+    async def add_block(self, block: AssistantOutputBlock) -> None:
+        """Render one non-final assistant block, editing the last message when possible."""
+        chunks = split_discord_text(block.text, DISCORD_MESSAGE_LIMIT)
         if not chunks:
             return
         async with self._lock:
-            for index, chunk in enumerate(chunks):
-                if not self._messages and index == 0:
-                    sent = await self._source_message.reply(chunk, mention_author=False)
-                else:
-                    sent = await self._source_message.channel.send(chunk)
-                self._messages.append(sent)
+            if not self._messages or block.starts_new_message:
+                await self._send_chunks(chunks)
+                return
 
-    async def finalize(self, fallback_text: str, *, status: str) -> None:
-        """Ensure the user sees a final response or non-success status."""
-        if not self._messages and fallback_text:
-            await self.add_block(fallback_text)
+            last_message = self._messages[-1]
+            separator = "\n\n" if last_message.content else ""
+            candidate = f"{last_message.content}{separator}{chunks[0]}"
+            start_index = 0
+            if len(candidate) <= DISCORD_MESSAGE_LIMIT:
+                await last_message.edit(content=candidate)
+                start_index = 1
+
+            await self._send_chunks(chunks[start_index:])
+
+    async def finalize(
+        self,
+        final_text: str,
+        *,
+        status: str,
+        token_usage_text: str = "",
+    ) -> None:
+        """Send the final assistant response as a fresh message."""
+        if final_text:
+            rendered = final_text
+            if token_usage_text:
+                rendered = f"{rendered}\n\n{token_usage_text}"
+            chunks = split_discord_text(rendered, DISCORD_MESSAGE_LIMIT)
+            if chunks:
+                async with self._lock:
+                    await self._send_chunks(chunks)
+            return
+
         if not self._messages and status not in {"completed", "succeeded"}:
             await self.fail(
                 self._messages_catalog.format(
                     "discord.turn_finished_with_status", status=status
                 )
             )
+
+    async def _send_chunks(self, chunks: list[str]) -> None:
+        """Send already-split chunks as new Discord messages."""
+        for chunk in chunks:
+            sent = await self._source_message.channel.send(chunk)
+            self._messages.append(sent)
 
     async def fail(self, error_text: str) -> None:
         """Render an error in the reply stream."""
@@ -65,7 +93,7 @@ class DiscordReplyStream:
         if not chunks:
             return
         if not self._messages:
-            first = await self._source_message.reply(chunks[0], mention_author=False)
+            first = await self._source_message.channel.send(chunks[0])
             self._messages.append(first)
             start_index = 1
         else:
@@ -149,12 +177,11 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
                 message.channel.id,
                 message.author.id,
             )
-            await message.reply(
+            await message.channel.send(
                 self._messages.format(
                     "discord.user_not_allowed",
                     user_id=message.author.id,
                 ),
-                mention_author=False,
             )
         else:
             voice_attachment = self._voice_attachment(message.attachments)
@@ -189,9 +216,8 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
             conversation_key,
             self._settings.codex.workspace_cwd,
         )
-        await message.reply(
-            self._messages.format("discord.session_cleared", model=model, cwd=cwd),
-            mention_author=False,
+        await message.channel.send(
+            self._messages.format("discord.session_cleared", model=model, cwd=cwd)
         )
 
     async def _handle_model(
@@ -205,9 +231,8 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
             current = self._session_store.get_model(
                 conversation_key, self._settings.codex.default_model
             )
-            await message.reply(
+            await message.channel.send(
                 self._messages.format("discord.current_model", current=current),
-                mention_author=False,
             )
             return
         had_saved_session = bool(self._session_store.get_session_id(conversation_key))
@@ -217,7 +242,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
             reply = self._messages.format("discord.model_updated_with_clear", model=model)
         else:
             reply = self._messages.format("discord.model_updated", model=model)
-        await message.reply(reply, mention_author=False)
+        await message.channel.send(reply)
 
     async def _handle_cwd(
         self,
@@ -231,24 +256,19 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
                 conversation_key,
                 self._settings.codex.workspace_cwd,
             )
-            await message.reply(
+            await message.channel.send(
                 self._messages.format("discord.current_cwd", current=current),
-                mention_author=False,
             )
             return
 
         resolved_cwd = self._resolve_cwd(raw_cwd)
         if resolved_cwd is None:
-            await message.reply(
-                self._messages.text("discord.invalid_cwd"),
-                mention_author=False,
-            )
+            await message.channel.send(self._messages.text("discord.invalid_cwd"))
             return
 
         self._session_store.set_cwd(conversation_key, resolved_cwd)
-        await message.reply(
-            self._messages.format("discord.cwd_updated", cwd=resolved_cwd),
-            mention_author=False,
+        await message.channel.send(
+            self._messages.format("discord.cwd_updated", cwd=resolved_cwd)
         )
 
     async def _handle_prompt(
@@ -260,10 +280,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
         active_turn = await self._conversation_state.get(conversation_key)
         if active_turn is not None:
             active_turn.queue_steer(prompt)
-            await message.reply(
-                self._messages.text("discord.turn_input_queued"),
-                mention_author=False,
-            )
+            await message.channel.send(self._messages.text("discord.turn_input_queued"))
             return
 
         active_turn = ActiveTurn(conversation_key=conversation_key)
@@ -272,10 +289,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
             existing = await self._conversation_state.get(conversation_key)
             if existing is not None:
                 existing.queue_steer(prompt)
-            await message.reply(
-                self._messages.text("discord.turn_input_queued"),
-                mention_author=False,
-            )
+            await message.channel.send(self._messages.text("discord.turn_input_queued"))
             return
 
         task = asyncio.create_task(self._run_turn(message, active_turn, prompt))
@@ -289,10 +303,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
     ) -> None:
         runner = self._runner
         if runner is None:
-            await message.reply(
-                self._messages.text("discord.runner_not_ready"),
-                mention_author=False,
-            )
+            await message.channel.send(self._messages.text("discord.runner_not_ready"))
             await self._conversation_state.finish(active_turn)
             return
 
@@ -336,7 +347,15 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
                         session_model=model,
                         session_cwd=cwd,
                     )
-                await reply_stream.finalize(result.assistant_text, status=result.status)
+                token_usage_text = _format_token_usage_text(
+                    self._messages,
+                    result.token_usage_last,
+                )
+                await reply_stream.finalize(
+                    result.final_assistant_text,
+                    status=result.status,
+                    token_usage_text=token_usage_text,
+                )
         except asyncio.CancelledError:
             if not active_turn.discard_output:
                 await reply_stream.fail(self._messages.text("discord.turn_cancelled"))
@@ -380,14 +399,12 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
                 self._settings.openai.enable_voice_control,
             )
             if self._settings.openai.enable_voice_control:
-                await message.reply(
+                await message.channel.send(
                     self._messages.text("discord.voice_not_configured"),
-                    mention_author=False,
                 )
             else:
-                await message.reply(
+                await message.channel.send(
                     self._messages.text("discord.voice_control_disabled"),
-                    mention_author=False,
                 )
             return None
 
@@ -407,12 +424,11 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
                 message.author.id,
                 voice_attachment.id,
             )
-            await message.reply(
+            await message.channel.send(
                 self._messages.format(
                     "discord.voice_transcription_failed",
                     error_text=str(exc),
                 ),
-                mention_author=False,
             )
             return None
 
@@ -423,10 +439,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
                 message.author.id,
                 voice_attachment.id,
             )
-            await message.reply(
-                self._messages.text("discord.voice_transcription_empty"),
-                mention_author=False,
-            )
+            await message.channel.send(self._messages.text("discord.voice_transcription_empty"))
             return None
 
         parts = [f"[Voice message transcript]\n{transcript}"]
@@ -446,3 +459,30 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
 
 def _matches_command(prompt: str, command: str) -> bool:
     return prompt == command or prompt.startswith(f"{command} ")
+
+
+def _format_token_usage_text(messages: Messages, token_usage_last: dict[str, int]) -> str:
+    if not isinstance(token_usage_last, dict):
+        return ""
+
+    def _format_token_count(value: int) -> str:
+        if value >= 100_000:
+            return f"{value / 1_000_000:.1f}M"
+        if value >= 1_000:
+            return f"{value / 1_000:.1f}k"
+        return str(value)
+
+    cached = int(token_usage_last.get("cached_input_tokens", 0) or 0)
+    input_tokens = int(token_usage_last.get("input_tokens", 0) or 0)
+    output_tokens = int(token_usage_last.get("output_tokens", 0) or 0)
+    total_tokens = int(token_usage_last.get("total_tokens", 0) or 0)
+    if cached <= 0 and input_tokens <= 0 and output_tokens <= 0 and total_tokens <= 0:
+        return ""
+
+    uncached_input_tokens = max(input_tokens - cached, 0)
+    return messages.format(
+        "discord.token_usage_last",
+        uncached=_format_token_count(uncached_input_tokens if cached > 0 else input_tokens),
+        cached=_format_token_count(cached),
+        output=_format_token_count(output_tokens),
+    )

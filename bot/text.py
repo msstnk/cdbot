@@ -61,6 +61,19 @@ def extract_assistant_text(turn: object | None) -> str:
     return "".join(chunks)
 
 
+def extract_last_assistant_text(turn: object | None) -> str:
+    """Extract only the final assistant text item from a completed Codex turn."""
+    if turn is None:
+        return ""
+
+    last_text = ""
+    for item in getattr(turn, "items", []) or []:
+        text = "".join(extract_text_blocks_from_item(item))
+        if text:
+            last_text = text
+    return last_text
+
+
 def extract_text_blocks_from_item(item: object) -> list[str]:
     """Extract assistant text blocks from a Codex item payload."""
     raw_item = item.model_dump(mode="json") if isinstance(item, ModelDumpable) else item

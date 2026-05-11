@@ -9,6 +9,7 @@ import pytest
 
 from bot.approval_router import ApprovalRequest, ApprovalRouter
 from bot.codex_runner import (
+    AssistantOutputBlock,
     CodexRunner,
     RunnerDependencies,
     RunnerEnvironment,
@@ -49,6 +50,19 @@ class FakeClient:
                             "text": "hello from item",
                         }
                     ),
+                ),
+            ),
+            FakeNotification(
+                method="thread/tokenUsage/updated",
+                payload=SimpleNamespace(
+                    token_usage=SimpleNamespace(
+                        total=SimpleNamespace(
+                            cached_input_tokens=10,
+                            input_tokens=20,
+                            output_tokens=30,
+                            total_tokens=50,
+                        )
+                    )
                 ),
             ),
             FakeNotification(
@@ -326,12 +340,19 @@ async def test_runner_emits_blocks_from_item_completed() -> None:
     )
     active_turn = ActiveTurn(conversation_key="dm:1")
     request = _turn_request()
-    blocks: list[str] = []
+    blocks: list[AssistantOutputBlock] = []
 
     result = await runner.run_turn(request, active_turn, lambda block: _record_block(blocks, block))
 
-    assert blocks == ["hello from item"]
+    assert blocks == []
     assert result.assistant_text == "hello from item"
+    assert result.final_assistant_text == "hello from item"
+    assert result.token_usage_last == {
+        "cached_input_tokens": 10,
+        "input_tokens": 20,
+        "output_tokens": 30,
+        "total_tokens": 50,
+    }
 
 
 @pytest.mark.asyncio
@@ -460,9 +481,124 @@ async def test_runner_preserves_full_file_change_diff_for_approval_preview() -> 
     assert preview["snippet"] == diff.strip()
 
 
-async def _ignore_delta(_: str) -> None:
+class FakeMultiMessageClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__(resume_error=False)
+        self.notifications = [
+            _assistant_notification("turn-1", "first"),
+            _assistant_notification("turn-1", "second"),
+            FakeNotification(
+                method="turn/completed",
+                payload=SimpleNamespace(
+                    turn=SimpleNamespace(
+                        id="turn-1",
+                        status=FakeStatus("completed"),
+                        items=[],
+                    )
+                ),
+            ),
+        ]
+
+
+class FakeApprovalBoundaryClient(FakeClient):
+    def __init__(self, approval_handler: Any) -> None:
+        super().__init__(resume_error=False)
+        self._approval_handler = approval_handler
+        self._approval_requested = False
+        self.notifications = [
+            _assistant_notification("turn-1", "first"),
+            _assistant_notification("turn-1", "second"),
+            _assistant_notification("turn-1", "third"),
+            FakeNotification(
+                method="turn/completed",
+                payload=SimpleNamespace(
+                    turn=SimpleNamespace(
+                        id="turn-1",
+                        status=FakeStatus("completed"),
+                        items=[],
+                    )
+                ),
+            ),
+        ]
+
+    def next_notification(self) -> object:
+        if not self._approval_requested and len(self.notifications) == 3:
+            self._approval_handler("shell.exec", {"command": "pwd"})
+            self._approval_requested = True
+        return self.notifications.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_runner_emits_only_non_final_blocks() -> None:
+    loop = asyncio.get_running_loop()
+    runner = _runner(
+        loop=loop,
+        client_factory=lambda _config, _approval_handler: FakeMultiMessageClient(),
+    )
+    active_turn = ActiveTurn(conversation_key="dm:1")
+    request = _turn_request()
+    blocks: list[AssistantOutputBlock] = []
+
+    result = await runner.run_turn(
+        request,
+        active_turn,
+        lambda block: _record_block(blocks, block),
+    )
+
+    assert blocks == [AssistantOutputBlock(text="first", starts_new_message=False)]
+    assert result.assistant_text == "firstsecond"
+    assert result.final_assistant_text == "second"
+
+
+@pytest.mark.asyncio
+async def test_runner_marks_next_block_after_approval_as_new_message() -> None:
+    loop = asyncio.get_running_loop()
+    approval_router = ApprovalCaptureRouter()
+    runner = _runner(
+        loop=loop,
+        approval_router=approval_router,
+        client_factory=lambda _config, approval_handler: FakeApprovalBoundaryClient(
+            approval_handler
+        ),
+    )
+    active_turn = ActiveTurn(conversation_key="dm:1")
+    request = _turn_request()
+    blocks: list[AssistantOutputBlock] = []
+
+    result = await runner.run_turn(
+        request,
+        active_turn,
+        lambda block: _record_block(blocks, block),
+    )
+
+    assert blocks == [
+        AssistantOutputBlock(text="first", starts_new_message=False),
+        AssistantOutputBlock(text="second", starts_new_message=True),
+    ]
+    assert result.assistant_text == "firstsecondthird"
+    assert result.final_assistant_text == "third"
+
+
+def _assistant_notification(turn_id: str, text: str) -> FakeNotification:
+    return FakeNotification(
+        method="item/completed",
+        payload=SimpleNamespace(
+            turn_id=turn_id,
+            item=SimpleNamespace(
+                model_dump=lambda mode="json": {
+                    "type": "agentMessage",
+                    "text": text,
+                }
+            ),
+        ),
+    )
+
+
+async def _ignore_delta(_: AssistantOutputBlock) -> None:
     return None
 
 
-async def _record_block(blocks: list[str], block: str) -> None:
+async def _record_block(
+    blocks: list[AssistantOutputBlock], block: AssistantOutputBlock
+) -> None:
     blocks.append(block)
