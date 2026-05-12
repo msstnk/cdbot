@@ -6,16 +6,16 @@ import asyncio
 import concurrent.futures
 import os
 import subprocess
+import threading
 from collections.abc import Callable, Coroutine
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from codex_app_server import AppServerClient, AppServerConfig
-from codex_app_server.client import _resolve_codex_bin
-from codex_app_server.errors import AppServerError
-from codex_app_server.models import JsonObject, JsonValue
+from openai_codex import AppServerConfig, AppServerError
+from openai_codex.client import AppServerClient, _resolve_codex_bin
+from openai_codex.models import JsonObject, JsonValue
 
 from .approval_router import ApprovalRequest, ApprovalRouter
 from .conversation_state import ActiveTurn
@@ -60,8 +60,8 @@ class AppServerClientProtocol(Protocol):
     def turn_interrupt(self, thread_id: str, turn_id: str) -> Any:
         """Interrupt an active Codex turn."""
 
-    def next_notification(self) -> Any:
-        """Return the next SDK notification."""
+    def next_turn_notification(self, turn_id: str) -> Any:
+        """Return the next SDK notification for a specific turn."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +119,7 @@ ClientFactory = Callable[[AppServerConfig, ApprovalHandler], AppServerClientProt
 BlockHandler = Callable[[AssistantOutputBlock], Coroutine[Any, Any, None]]
 FileChangePreview = dict[str, str]
 CDBOT_ENV_PREFIX = "CDBOT_"
+DEFAULT_RUNNER_DEBUG_LEVEL = "OFF"
 THREAD_RESUME_FALLBACK_ERRORS = (AppServerError, OSError, RuntimeError, ValueError)
 APPROVAL_REQUEST_ERRORS = (
     RuntimeError,
@@ -134,6 +135,7 @@ class RunnerEnvironment:
     codex_bin: str
     codex_home: str | Path
     workspace_cwd: str
+    debug_level_name: str = DEFAULT_RUNNER_DEBUG_LEVEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +215,7 @@ class SanitizedAppServerClient(AppServerClient):
         )
         self._proc_context = proc_context
         self._start_stderr_drain_thread()
+        self._start_reader_thread()
 
     def close(self) -> None:
         proc_context = cast(ExitStack | None, getattr(self, "_proc_context", None))
@@ -220,6 +223,25 @@ class SanitizedAppServerClient(AppServerClient):
         super().close()
         if proc_context is not None:
             proc_context.close()
+
+    def _start_stderr_drain_thread(self) -> None:
+        if self._proc is None or self._proc.stderr is None:
+            return
+
+        proc = self._proc
+        logger = get_logger()
+
+        def _drain() -> None:
+            stderr = proc.stderr
+            if stderr is None:
+                return
+            for line in stderr:
+                message = line.rstrip("\n")
+                self._stderr_lines.append(message)
+                logger.debug("sdk.stderr %s", message)
+
+        self._stderr_thread = threading.Thread(target=_drain, daemon=True)
+        self._stderr_thread.start()
 
 
 class CodexRunner:
@@ -238,6 +260,7 @@ class CodexRunner:
             codex_bin=environment.codex_bin,
             codex_home=str(environment.codex_home),
             workspace_cwd=environment.workspace_cwd,
+            debug_level_name=environment.debug_level_name,
         )
         self._client_factory = dependencies.client_factory or self._default_client_factory
         self._messages = dependencies.messages or load_default_messages()
@@ -340,7 +363,20 @@ class CodexRunner:
         request: TurnRequest,
     ) -> None:
         self._logger.debug("sdk.start config=%s", dump_for_log(config))
+        self._logger.debug(
+            "sdk.process.start conversation_key=%s",
+            request.context.conversation_key,
+        )
         client.start()
+        self._logger.debug(
+            "sdk.process.started conversation_key=%s pid=%s",
+            request.context.conversation_key,
+            _client_pid(client),
+        )
+        self._logger.debug(
+            "sdk.initialize.start conversation_key=%s",
+            request.context.conversation_key,
+        )
         client.initialize()
         self._logger.debug(
             "sdk.initialize.ok conversation_key=%s",
@@ -462,7 +498,7 @@ class CodexRunner:
     ) -> None:
         while True:
             self._flush_turn_controls(client, runtime.active_turn, state)
-            notification = client.next_notification()
+            notification = client.next_turn_notification(state.turn_id)
             if self._handle_notification(notification, runtime, state):
                 return
 
@@ -626,7 +662,10 @@ class CodexRunner:
         return AppServerConfig(
             codex_bin=self._environment.codex_bin,
             cwd=cwd or self._environment.workspace_cwd,
-            env={"CODEX_HOME": str(self._environment.codex_home)},
+            env=_build_codex_runtime_env(
+                codex_home=self._environment.codex_home,
+                debug_level_name=self._environment.debug_level_name,
+            ),
         )
 
     def _run_coroutine(self, awaitable: Coroutine[Any, Any, None]) -> None:
@@ -653,6 +692,29 @@ def _build_app_server_env(env_overrides: dict[str, str] | None) -> dict[str, str
     if env_overrides:
         env.update(env_overrides)
     return env
+
+
+def _build_codex_runtime_env(*, codex_home: str | Path, debug_level_name: str) -> dict[str, str]:
+    env = {"CODEX_HOME": str(codex_home)}
+    rust_log = _child_rust_log_level(debug_level_name)
+    if rust_log:
+        env["RUST_LOG"] = rust_log
+    return env
+
+
+def _child_rust_log_level(level_name: str) -> str:
+    normalized = level_name.strip().upper()
+    if normalized in {"OFF", "NONE"}:
+        return ""
+    if normalized == "WARNING":
+        return "warn"
+    return normalized.lower()
+
+
+def _client_pid(client: object) -> str:
+    proc = getattr(client, "_proc", None)
+    pid = getattr(proc, "pid", None)
+    return str(pid or "-")
 
 
 def _extract_file_change_item_id(payload: JsonObject) -> str:
@@ -745,10 +807,20 @@ def _normalize_token_usage(usage_last: object) -> dict[str, int]:
 
 def _int_payload_value(payload: object, *keys: str) -> int:
     value = _payload_value(payload, *keys)
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
+    if value is None:
         return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
 
 
 def _payload_value(payload: object, *keys: str) -> object:

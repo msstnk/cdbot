@@ -138,6 +138,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
                 codex_bin=self._settings.codex.bin_path,
                 codex_home=self._settings.codex.home_path,
                 workspace_cwd=self._settings.codex.workspace_cwd,
+                debug_level_name=self._settings.debug.level_name,
             ),
             dependencies=RunnerDependencies(
                 approval_router=self._approval_router,

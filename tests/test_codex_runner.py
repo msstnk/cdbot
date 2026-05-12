@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from openai_codex import AppServerConfig
 
 from bot.approval_router import ApprovalRequest, ApprovalRouter
 from bot.codex_runner import (
@@ -14,6 +16,7 @@ from bot.codex_runner import (
     RunnerDependencies,
     RunnerEnvironment,
     SessionContext,
+    SanitizedAppServerClient,
     TurnContext,
     TurnRequest,
     _build_app_server_env,
@@ -112,7 +115,8 @@ class FakeClient:
     def turn_interrupt(self, thread_id: str, turn_id: str) -> object:
         return object()
 
-    def next_notification(self) -> object:
+    def next_turn_notification(self, turn_id: str) -> object:
+        _ = turn_id
         return self.notifications.pop(0)
 
 
@@ -182,7 +186,8 @@ class FakeApprovalClient(FakeClient):
         ]
         self.approval_result: dict[str, Any] | None = None
 
-    def next_notification(self) -> object:
+    def next_turn_notification(self, turn_id: str) -> object:
+        _ = turn_id
         if not self._approval_requested and self.notifications:
             next_method = self.notifications[0].method
             if next_method == "turn/completed":
@@ -199,7 +204,7 @@ class DummyChannel:
     async def send(self, *args: Any, **kwargs: Any) -> object:
         return object()
 
-
+# pylint: disable=too-many-arguments
 def _turn_request(
     *,
     prompt: str = "hello",
@@ -224,6 +229,9 @@ def _turn_request(
             session_cwd=session_cwd,
         ),
     )
+
+
+# pylint: enable=too-many-arguments
 
 
 def _runner(
@@ -268,6 +276,25 @@ def test_runner_builds_config_with_request_cwd() -> None:
     assert config.env == {"CODEX_HOME": "/tmp/.codex"}
 
 
+def test_runner_builds_config_with_rust_log_from_debug_level() -> None:
+    runner = CodexRunner(
+        environment=RunnerEnvironment(
+            codex_bin="/tmp/codex",
+            codex_home="/tmp/.codex",
+            workspace_cwd="/tmp/default",
+            debug_level_name="DEBUG",
+        ),
+        dependencies=RunnerDependencies(
+            approval_router=ApprovalRouter(timeout_sec=0.1),
+            loop=asyncio.new_event_loop(),
+        ),
+    )
+
+    config = runner._build_config("/tmp/project")
+
+    assert config.env == {"CODEX_HOME": "/tmp/.codex", "RUST_LOG": "debug"}
+
+
 def test_build_app_server_env_removes_cdbot_variables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -281,6 +308,44 @@ def test_build_app_server_env_removes_cdbot_variables(
     assert env["OPENAI_API_KEY"] == "visible"
     assert env["CODEX_HOME"] == "/tmp/.codex"
     assert "CDBOT_DISCORD_BOT_TOKEN" not in env
+
+
+def test_sanitized_client_start_starts_reader_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePopen:
+        def __init__(self) -> None:
+            self.stdin = object()
+            self.stdout = object()
+            self.stderr = object()
+            self.pid = 123
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            _ = (exc_type, exc, tb)
+
+    def fake_popen(*args: Any, **kwargs: Any) -> FakePopen:
+        _ = (args, kwargs)
+        return FakePopen()
+
+    monkeypatch.setattr("bot.codex_runner._resolve_codex_bin", lambda _config: Path("/tmp/codex"))
+    monkeypatch.setattr("bot.codex_runner.subprocess.Popen", fake_popen)
+    client = SanitizedAppServerClient(
+        config=AppServerConfig(
+            codex_bin="/tmp/codex",
+            cwd="/tmp/project",
+            env={"CODEX_HOME": "/tmp/.codex"},
+        )
+    )
+    started: list[str] = []
+    client._start_stderr_drain_thread = lambda: started.append("stderr")  # type: ignore[method-assign]
+    client._start_reader_thread = lambda: started.append("reader")  # type: ignore[method-assign]
+
+    client.start()
+
+    assert started == ["stderr", "reader"]
 
 
 @pytest.mark.asyncio
@@ -344,7 +409,7 @@ async def test_runner_emits_blocks_from_item_completed() -> None:
 
     result = await runner.run_turn(request, active_turn, lambda block: _record_block(blocks, block))
 
-    assert blocks == []
+    assert not blocks
     assert result.assistant_text == "hello from item"
     assert result.final_assistant_text == "hello from item"
     assert result.token_usage_last == {
@@ -521,7 +586,8 @@ class FakeApprovalBoundaryClient(FakeClient):
             ),
         ]
 
-    def next_notification(self) -> object:
+    def next_turn_notification(self, turn_id: str) -> object:
+        _ = turn_id
         if not self._approval_requested and len(self.notifications) == 3:
             self._approval_handler("shell.exec", {"command": "pwd"})
             self._approval_requested = True

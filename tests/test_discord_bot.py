@@ -137,9 +137,10 @@ class DummyMessage:
         self.attachments = attachments or []
         self.replies: list[str] = []
 
-    async def reply(self, content: str, *, mention_author: bool = False) -> None:
+    async def reply(self, content: str, *, mention_author: bool = False) -> DummySentMessage:
         assert mention_author is False
         self.replies.append(content)
+        return DummySentMessage(content)
 
 
 class DummySentMessage:
