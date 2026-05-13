@@ -20,6 +20,7 @@ from openai_codex.models import JsonObject, JsonValue
 from .approval_router import ApprovalRequest, ApprovalRouter
 from .conversation_state import ActiveTurn
 from .debug_logging import dump_for_log, get_logger, trace
+from .helper import parse_int
 from .localization import Messages, load_default_messages
 from .text import (
     extract_assistant_text,
@@ -158,21 +159,28 @@ class TurnRuntime:
 
 
 @dataclass(slots=True)
+class TurnOutputState:
+    """Assistant output accumulated while one Codex turn is running."""
+
+    assistant_parts: list[str] = field(default_factory=list)
+    pending_output_block: AssistantOutputBlock | None = None
+    next_output_starts_new_message: bool = False
+    completed_turn: object | None = None
+
+
+@dataclass(slots=True)
 class TurnExecutionState:
     """State accumulated while one Codex turn is running."""
 
     file_change_preview_by_item_id: dict[str, list[FileChangePreview]] = field(
         default_factory=dict
     )
-    assistant_parts: list[str] = field(default_factory=list)
+    output: TurnOutputState = field(default_factory=TurnOutputState)
     token_usage_last: dict[str, int] = field(default_factory=dict)
     resumed: bool = False
     status: str = "unknown"
     thread_id: str = ""
     turn_id: str = ""
-    pending_output_block: AssistantOutputBlock | None = None
-    next_output_starts_new_message: bool = False
-    completed_turn: object | None = None
 
 
 class SanitizedAppServerClient(AppServerClient):
@@ -238,7 +246,7 @@ class SanitizedAppServerClient(AppServerClient):
             for line in stderr:
                 message = line.rstrip("\n")
                 self._stderr_lines.append(message)
-                logger.debug("sdk.stderr %s", message)
+                trace(logger, "sdk.stderr %s", message)
 
         self._stderr_thread = threading.Thread(target=_drain, daemon=True)
         self._stderr_thread.start()
@@ -318,13 +326,13 @@ class CodexRunner:
             client.close()
 
         assistant_text = (
-            "".join(state.assistant_parts)
-            or extract_assistant_text(state.completed_turn)
+            "".join(state.output.assistant_parts)
+            or extract_assistant_text(state.output.completed_turn)
         )
         final_assistant_text = (
-            state.pending_output_block.text
-            if state.pending_output_block is not None
-            else extract_last_assistant_text(state.completed_turn)
+            state.output.pending_output_block.text
+            if state.output.pending_output_block is not None
+            else extract_last_assistant_text(state.output.completed_turn)
         )
         self._logger.debug(
             (
@@ -564,7 +572,7 @@ class CodexRunner:
             getattr(payload, "turn", None), "id", ""
         ) == state.turn_id:
             completed_payload = cast(Any, payload)
-            state.completed_turn = completed_payload.turn
+            state.output.completed_turn = completed_payload.turn
             raw_status = getattr(
                 completed_payload.turn.status,
                 "value",
@@ -591,16 +599,19 @@ class CodexRunner:
         if not text:
             return
 
-        state.assistant_parts.append(text)
+        state.output.assistant_parts.append(text)
         completed_block = AssistantOutputBlock(
             text=text,
-            starts_new_message=state.next_output_starts_new_message,
+            starts_new_message=state.output.next_output_starts_new_message,
         )
-        state.next_output_starts_new_message = False
+        state.output.next_output_starts_new_message = False
 
-        if state.pending_output_block is not None and not runtime.active_turn.discard_output:
-            self._run_coroutine(runtime.on_block(state.pending_output_block))
-        state.pending_output_block = completed_block
+        if (
+            state.output.pending_output_block is not None
+            and not runtime.active_turn.discard_output
+        ):
+            self._run_coroutine(runtime.on_block(state.output.pending_output_block))
+        state.output.pending_output_block = completed_block
 
     def _make_approval_handler(
         self,
@@ -610,7 +621,7 @@ class CodexRunner:
         file_change_preview_by_item_id: dict[str, list[FileChangePreview]],
     ) -> ApprovalHandler:
         def approval_handler(method: str, params: JsonObject | None) -> JsonObject:
-            state.next_output_starts_new_message = True
+            state.output.next_output_starts_new_message = True
             approval_params = dict(params or {})
             if method == "item/fileChange/requestApproval":
                 approval_item_id = _extract_file_change_item_id(approval_params)
@@ -809,18 +820,7 @@ def _int_payload_value(payload: object, *keys: str) -> int:
     value = _payload_value(payload, *keys)
     if value is None:
         return 0
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
-            return 0
-    return 0
+    return parse_int(value)
 
 
 def _payload_value(payload: object, *keys: str) -> object:

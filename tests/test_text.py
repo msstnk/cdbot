@@ -53,7 +53,7 @@ def test_clip_text_uses_ellipsis_when_truncated() -> None:
 
 
 def test_extract_text_blocks_from_agent_message() -> None:
-    item = {"type": "agentMessage", "text": "hello"}
+    item = DumpableItem({"type": "agentMessage", "text": "hello"})
 
     blocks = extract_text_blocks_from_item(item)
 
@@ -61,15 +61,17 @@ def test_extract_text_blocks_from_agent_message() -> None:
 
 
 def test_extract_text_blocks_from_assistant_output_text_content() -> None:
-    item = {
-        "type": "message",
-        "role": "assistant",
-        "content": [
-            {"type": "output_text", "text": "hello"},
-            {"type": "input_text", "text": "ignored"},
-            {"type": "output_text", "text": " world"},
-        ],
-    }
+    item = DumpableItem(
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "hello"},
+                {"type": "input_text", "text": "ignored"},
+                {"type": "output_text", "text": " world"},
+            ],
+        }
+    )
 
     blocks = extract_text_blocks_from_item(item)
 
@@ -77,11 +79,13 @@ def test_extract_text_blocks_from_assistant_output_text_content() -> None:
 
 
 def test_extract_text_blocks_ignores_non_assistant_messages() -> None:
-    item = {
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "output_text", "text": "ignored"}],
-    }
+    item = DumpableItem(
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "output_text", "text": "ignored"}],
+        }
+    )
 
     blocks = extract_text_blocks_from_item(item)
 

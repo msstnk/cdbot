@@ -14,6 +14,7 @@ from bot.codex_runner import AssistantOutputBlock, TurnResult
 from bot.config import (
     CodexSettings,
     DebugSettings,
+    DiscordSettings,
     LocaleSettings,
     OpenAISettings,
     Settings,
@@ -98,7 +99,7 @@ class DummyTurnChannel(DummyChannel):
         super().__init__()
         self.sent_messages: list[DummySentMessage] = []
 
-    async def send(self, content: str) -> "DummySentMessage":
+    async def send(self, content: str) -> DummySentMessage:
         sent = DummySentMessage(content)
         self.sent_messages.append(sent)
         return sent
@@ -271,7 +272,7 @@ class FakeVoiceTranscriber:
         self._transcript = transcript
         self.attachments: list[Any] = []
 
-    async def transcribe_attachment(self, attachment: object) -> str:
+    async def __call__(self, attachment: object) -> str:
         self.attachments.append(attachment)
         if self._error is not None:
             raise self._error
@@ -742,7 +743,9 @@ async def test_run_turn_appends_token_usage_message(tmp_path: Path) -> None:
     await bot._run_turn(cast(discord.Message, message), active_turn, "hello")
 
     assert [sent.content for sent in message.channel.sent_messages] == [
-        "assistant reply\n\n-# *Token usage for this session - 4.0k uncached + 8.0k cached input, 5.0k output*"
+        "assistant reply\n\n"
+        "-# *Token usage for this session - "
+        "4.0k uncached + 8.0k cached input, 5.0k output*"
     ]
 
 
@@ -773,8 +776,11 @@ def _settings(
     codex_bin = tmp_path / "codex"
     codex_bin.write_text("", encoding="utf-8")
     return Settings(
-        discord_bot_token="token",
-        whitelisted_users=frozenset(whitelisted_users),
+        discord=DiscordSettings(
+            bot_token="token",
+            whitelisted_users=frozenset(whitelisted_users),
+            approval_timeout_sec=60,
+        ),
         codex=CodexSettings(
             bin_path=str(codex_bin),
             home_path=tmp_path / ".codex",
@@ -786,7 +792,6 @@ def _settings(
             api_key="",
             transcription_model="whisper-1",
         ),
-        approval_timeout_sec=60.0,
         storage=StorageSettings(
             session_store_path=tmp_path / "sessions.jsonl",
             debug_log_path=tmp_path / "cdbot.log",

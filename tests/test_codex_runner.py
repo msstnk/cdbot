@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import SimpleNamespace, TracebackType
 from typing import Any, cast
 
 import pytest
@@ -15,13 +16,14 @@ from bot.codex_runner import (
     CodexRunner,
     RunnerDependencies,
     RunnerEnvironment,
-    SessionContext,
     SanitizedAppServerClient,
+    SessionContext,
     TurnContext,
     TurnRequest,
     _build_app_server_env,
 )
 from bot.conversation_state import ActiveTurn
+from bot.debug_logging import configure_debug_logger
 
 
 @dataclass
@@ -320,17 +322,25 @@ def test_sanitized_client_start_starts_reader_thread(
             self.stderr = object()
             self.pid = 123
 
-        def __enter__(self):
+        def __enter__(self) -> FakePopen:
             return self
 
-        def __exit__(self, exc_type, exc, tb) -> None:
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> None:
             _ = (exc_type, exc, tb)
 
     def fake_popen(*args: Any, **kwargs: Any) -> FakePopen:
         _ = (args, kwargs)
         return FakePopen()
 
-    monkeypatch.setattr("bot.codex_runner._resolve_codex_bin", lambda _config: Path("/tmp/codex"))
+    monkeypatch.setattr(
+        "bot.codex_runner._resolve_codex_bin",
+        lambda _config: Path("/tmp/codex"),
+    )
     monkeypatch.setattr("bot.codex_runner.subprocess.Popen", fake_popen)
     client = SanitizedAppServerClient(
         config=AppServerConfig(
@@ -346,6 +356,30 @@ def test_sanitized_client_start_starts_reader_thread(
     client.start()
 
     assert started == ["stderr", "reader"]
+
+
+def test_sanitized_client_stderr_logs_at_trace(tmp_path: Path) -> None:
+    log_path = tmp_path / "cdbot.log"
+    configure_debug_logger(level_name="DEBUG", log_path=log_path)
+    client = SanitizedAppServerClient(config=AppServerConfig(codex_bin="/tmp/codex"))
+    cast(Any, client)._proc = SimpleNamespace(stderr=io.StringIO("noisy\n"))
+
+    client._start_stderr_drain_thread()
+    debug_thread = client._stderr_thread
+    assert debug_thread is not None
+    debug_thread.join(timeout=1)
+
+    assert "noisy" not in log_path.read_text(encoding="utf-8")
+
+    configure_debug_logger(level_name="TRACE", log_path=log_path)
+    cast(Any, client)._proc = SimpleNamespace(stderr=io.StringIO("visible\n"))
+
+    client._start_stderr_drain_thread()
+    trace_thread = client._stderr_thread
+    assert trace_thread is not None
+    trace_thread.join(timeout=1)
+
+    assert "TRACE cdbot sdk.stderr visible" in log_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

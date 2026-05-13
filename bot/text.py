@@ -76,22 +76,22 @@ def extract_last_assistant_text(turn: object | None) -> str:
 
 def extract_text_blocks_from_item(item: object) -> list[str]:
     """Extract assistant text blocks from a Codex item payload."""
-    raw_item = item.model_dump(mode="json") if isinstance(item, ModelDumpable) else item
-    if not isinstance(raw_item, dict):
+    if not isinstance(item, ModelDumpable):
         return []
+    payload = item.model_dump(mode="json")
 
-    item_type = raw_item.get("type")
+    item_type = payload.get("type")
     if item_type == "agentMessage":
-        text = raw_item.get("text")
+        text = payload.get("text")
         if isinstance(text, str) and text:
             return [text]
         return []
 
-    if item_type != "message" or raw_item.get("role") != "assistant":
+    if item_type != "message" or payload.get("role") != "assistant":
         return []
 
     blocks: list[str] = []
-    for content in raw_item.get("content") or []:
+    for content in payload.get("content") or []:
         if not isinstance(content, dict) or content.get("type") != "output_text":
             continue
         text = content.get("text")

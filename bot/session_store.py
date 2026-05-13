@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
 from pathlib import Path
+
+from .helper import now_iso
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,14 +61,14 @@ class SessionStore:
     def get_session_cwd(self, conversation_key: str) -> str:
         """Return the cwd associated with the stored Codex thread."""
         record = self.get(conversation_key)
-        if record is None or not record.identity.session_cwd:
+        if record is None:
             return ""
         return record.identity.session_cwd
 
     def get_session_model(self, conversation_key: str) -> str:
         """Return the model associated with the stored Codex thread."""
         record = self.get(conversation_key)
-        if record is None or not record.identity.session_model:
+        if record is None:
             return ""
         return record.identity.session_model
 
@@ -142,17 +143,10 @@ class SessionStore:
         if existing is None:
             return
         if existing.discord_user_id or existing.defaults.model or existing.defaults.cwd:
-            now = _now_iso()
-            self._records[conversation_key] = SessionRecord(
-                conversation_key=conversation_key,
-                discord_user_id=existing.discord_user_id,
+            self._records[conversation_key] = replace(
+                existing,
                 identity=SessionIdentity(),
-                defaults=ConversationDefaults(
-                    model=existing.defaults.model,
-                    cwd=existing.defaults.cwd,
-                ),
-                created_at=existing.created_at,
-                updated_at=now,
+                updated_at=now_iso(),
             )
         else:
             del self._records[conversation_key]
@@ -167,43 +161,27 @@ class SessionStore:
         discord_user_id: int | None = None,
     ) -> SessionRecord:
         self._load_if_needed()
-        now = _now_iso()
+        now = now_iso()
         existing = self._records.get(conversation_key)
-        current_identity = SessionIdentity() if existing is None else existing.identity
-        current_defaults = ConversationDefaults() if existing is None else existing.defaults
-        record = SessionRecord(
-            conversation_key=conversation_key,
-            discord_user_id=_pick_int_value(
-                discord_user_id,
-                0 if existing is None else existing.discord_user_id,
-            ),
-            identity=SessionIdentity(
-                session_id=_pick_value(
-                    None if identity is None else identity.session_id,
-                    current_identity.session_id,
-                ),
-                session_model=_pick_value(
-                    None if identity is None else identity.session_model,
-                    current_identity.session_model,
-                ),
-                session_cwd=_pick_value(
-                    None if identity is None else identity.session_cwd,
-                    current_identity.session_cwd,
-                ),
-            ),
-            defaults=ConversationDefaults(
-                model=_pick_value(
-                    None if defaults is None else defaults.model,
-                    current_defaults.model,
-                ),
-                cwd=_pick_value(
-                    None if defaults is None else defaults.cwd,
-                    current_defaults.cwd,
-                ),
-            ),
-            created_at=existing.created_at if existing is not None else now,
-            updated_at=now,
-        )
+        if existing is None:
+            record = SessionRecord(
+                conversation_key=conversation_key,
+                discord_user_id=0,
+                identity=SessionIdentity(),
+                defaults=ConversationDefaults(),
+                created_at=now,
+                updated_at=now,
+            )
+        else:
+            record = replace(existing, updated_at=now)
+
+        if identity is not None:
+            record = replace(record, identity=identity)
+        if defaults is not None:
+            record = replace(record, defaults=defaults)
+        if discord_user_id is not None:
+            record = replace(record, discord_user_id=discord_user_id)
+
         self._records[conversation_key] = record
         self._write_records()
         return record
@@ -217,30 +195,23 @@ class SessionStore:
                 if not line.strip():
                     continue
                 raw = json.loads(line)
-                conversation_key = str(raw.get("conversation_key") or "").strip()
+                conversation_key = (raw.get("conversation_key") or "").strip()
                 if not conversation_key:
                     continue
-                discord_user_id = _parse_int(raw.get("discord_user_id"))
-                session_id = str(raw.get("session_id") or "")
-                session_model = str(raw.get("session_model") or "")
-                session_cwd = str(raw.get("session_cwd") or "")
-                model = str(raw.get("model") or "")
-                cwd = str(raw.get("cwd") or "")
-                updated_at = str(raw.get("updated_at") or _now_iso())
-                created_at = str(raw.get("created_at") or updated_at)
+                updated_at = raw.get("updated_at") or now_iso()
                 self._records[conversation_key] = SessionRecord(
                     conversation_key=conversation_key,
-                    discord_user_id=discord_user_id,
+                    discord_user_id=raw.get("discord_user_id") or 0,
                     identity=SessionIdentity(
-                        session_id=session_id,
-                        session_model=session_model,
-                        session_cwd=session_cwd,
+                        session_id=raw.get("session_id") or "",
+                        session_model=raw.get("session_model") or "",
+                        session_cwd=raw.get("session_cwd") or "",
                     ),
                     defaults=ConversationDefaults(
-                        model=model,
-                        cwd=cwd,
+                        model=raw.get("model") or "",
+                        cwd=raw.get("cwd") or "",
                     ),
-                    created_at=created_at,
+                    created_at=raw.get("created_at") or updated_at,
                     updated_at=updated_at,
                 )
         self._loaded = True
@@ -270,32 +241,3 @@ class SessionStore:
                     )
                     + "\n"
                 )
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-def _pick_value(value: str | None, current: str) -> str:
-    if value is not None:
-        return value
-    return current
-
-
-def _pick_int_value(value: int | None, current: int) -> int:
-    if value is not None:
-        return value
-    return current
-
-
-def _parse_int(value: object) -> int:
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
-            return 0
-    return 0

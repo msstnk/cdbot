@@ -1,25 +1,25 @@
 """OpenAI-backed transcription for Discord voice message attachments."""
-# pylint: disable=import-outside-toplevel,too-few-public-methods
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from discord import DiscordException
+from openai import AsyncOpenAI, OpenAIError
+
 from .debug_logging import get_logger
 
+VoiceTranscriber = Callable[[Any], Awaitable[str]]
 
-class OpenAIVoiceTranscriber:
-    """Transcribe Discord voice attachments with the OpenAI audio API."""
 
-    def __init__(self, *, api_key: str, model: str) -> None:
-        from openai import AsyncOpenAI
+def make_openai_voice_transcriber(*, api_key: str, model: str) -> VoiceTranscriber:
+    """Return a voice attachment transcriber backed by the OpenAI audio API."""
+    client = AsyncOpenAI(api_key=api_key)
+    logger = get_logger()
 
-        self._client = AsyncOpenAI(api_key=api_key)
-        self._logger = get_logger()
-        self._model = model
-
-    async def transcribe_attachment(self, attachment: Any) -> str:
+    async def transcribe_attachment(attachment: Any) -> str:
         """Return a text transcript for one Discord voice attachment."""
         filename = _normalized_filename(
             getattr(attachment, "filename", ""),
@@ -27,31 +27,33 @@ class OpenAIVoiceTranscriber:
         )
         media_type = getattr(attachment, "content_type", None) or "audio/ogg"
         size = getattr(attachment, "size", 0)
-        self._logger.debug(
+        logger.debug(
             "discord.voice.transcription.start attachment_id=%s filename=%s size=%s model=%s",
             getattr(attachment, "id", "-"),
             filename,
             size,
-            self._model,
+            model,
         )
         try:
             audio_bytes = await attachment.read()
-            transcription = await self._client.audio.transcriptions.create(
+            transcription = await client.audio.transcriptions.create(
                 file=(filename, audio_bytes, media_type),
-                model=self._model,
+                model=model,
             )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except (DiscordException, OpenAIError, OSError) as exc:
             raise RuntimeError("OpenAI voice transcription request failed") from exc
         text = getattr(transcription, "text", "")
         if not isinstance(text, str):
             raise RuntimeError("OpenAI transcription response did not include text")
         normalized = text.strip()
-        self._logger.debug(
+        logger.debug(
             "discord.voice.transcription.ok attachment_id=%s transcript_chars=%s",
             getattr(attachment, "id", "-"),
             len(normalized),
         )
         return normalized
+
+    return transcribe_attachment
 
 
 def _normalized_filename(filename: str, content_type: object) -> str:

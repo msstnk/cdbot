@@ -13,7 +13,7 @@ DEFAULT_CODEX_HOME = Path(".codex")
 DEFAULT_SESSION_STORE = Path(".local/session_store.jsonl")
 DEFAULT_DEBUG_LOG_PATH = Path(".local/cdbot.log")
 DEFAULT_MODEL = "gpt-5.5"
-DEFAULT_APPROVAL_TIMEOUT_SEC = 60.0
+DEFAULT_APPROVAL_TIMEOUT_SEC = 60
 DEFAULT_CDBOT_DEBUG_LEVEL = "OFF"
 DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "whisper-1"
 DEFAULT_ENABLE_VOICE_CONTROL = False
@@ -69,6 +69,15 @@ class DebugSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscordSettings:
+    """Discord identity and access settings."""
+
+    bot_token: str
+    whitelisted_users: frozenset[int]
+    approval_timeout_sec: int
+
+
+@dataclass(frozen=True, slots=True)
 class LocaleSettings:
     """Localization catalog configuration."""
 
@@ -77,15 +86,12 @@ class LocaleSettings:
 
 
 @dataclass(frozen=True, slots=True)
-# pylint: disable=too-many-instance-attributes
 class Settings:
     """Runtime settings for the Discord bot and Codex runner."""
 
-    discord_bot_token: str
-    whitelisted_users: frozenset[int]
+    discord: DiscordSettings
     codex: CodexSettings
     openai: OpenAISettings
-    approval_timeout_sec: float
     storage: StorageSettings
     debug: DebugSettings
     localization: LocaleSettings
@@ -107,7 +113,12 @@ class Settings:
         approval_timeout_raw = os.environ.get(ENV_APPROVAL_TIMEOUT_SEC, "").strip()
         approval_timeout_sec = DEFAULT_APPROVAL_TIMEOUT_SEC
         if approval_timeout_raw:
-            approval_timeout_sec = max(1.0, float(approval_timeout_raw))
+            try:
+                approval_timeout_sec = max(1, int(approval_timeout_raw))
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"{ENV_APPROVAL_TIMEOUT_SEC} must be an integer"
+                ) from exc
 
         session_store_path = Path(
             os.environ.get(ENV_SESSION_STORE_PATH, str(DEFAULT_SESSION_STORE))
@@ -134,8 +145,11 @@ class Settings:
         )
 
         return cls(
-            discord_bot_token=token,
-            whitelisted_users=whitelisted_users,
+            discord=DiscordSettings(
+                bot_token=token,
+                whitelisted_users=whitelisted_users,
+                approval_timeout_sec=approval_timeout_sec,
+            ),
             codex=CodexSettings(
                 bin_path=codex_bin,
                 home_path=codex_home,
@@ -159,7 +173,6 @@ class Settings:
                     or DEFAULT_OPENAI_TRANSCRIPTION_MODEL
                 ),
             ),
-            approval_timeout_sec=approval_timeout_sec,
             storage=StorageSettings(
                 session_store_path=session_store_path,
                 debug_log_path=debug_log_path,
