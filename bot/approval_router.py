@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any
 
 import discord
 
 from .config import DISCORD_MESSAGE_LIMIT
+from .helper import now_iso
 from .localization import Messages, load_default_messages
 from .text import clip_text
 
@@ -62,7 +62,7 @@ class PendingApproval:
             ApprovalDecision(
                 decision=decision,
                 actor_name=actor_name,
-                resolved_at=_now_iso(),
+                resolved_at=now_iso(),
                 reason=reason,
             )
         )
@@ -139,7 +139,7 @@ class ApprovalView(discord.ui.View):
         decision = ApprovalDecision(
             decision="accept",
             actor_name=interaction.user.display_name,
-            resolved_at=_now_iso(),
+            resolved_at=now_iso(),
         )
         self._state.pending.resolve(
             decision.decision,
@@ -165,7 +165,7 @@ class ApprovalView(discord.ui.View):
         decision = ApprovalDecision(
             decision="accept",
             actor_name=interaction.user.display_name,
-            resolved_at=_now_iso(),
+            resolved_at=now_iso(),
             reason=TURN_APPROVAL_REASON,
         )
         self._state.pending.resolve(
@@ -188,7 +188,7 @@ class ApprovalView(discord.ui.View):
         decision = ApprovalDecision(
             decision="deny",
             actor_name=interaction.user.display_name,
-            resolved_at=_now_iso(),
+            resolved_at=now_iso(),
         )
         self._state.pending.resolve(
             decision.decision,
@@ -203,7 +203,7 @@ class ApprovalView(discord.ui.View):
         decision = ApprovalDecision(
             decision="deny",
             actor_name=None,
-            resolved_at=_now_iso(),
+            resolved_at=now_iso(),
             reason=TIMEOUT_REASON,
         )
         resolved = self._state.pending.resolve(
@@ -291,7 +291,7 @@ class ApprovalRouter:
             decision = ApprovalDecision(
                 decision="accept",
                 actor_name=None,
-                resolved_at=_now_iso(),
+                resolved_at=now_iso(),
                 reason=TURN_APPROVAL_REASON,
             )
             try:
@@ -321,7 +321,7 @@ class ApprovalRouter:
                 ApprovalDecision(
                     decision="deny",
                     actor_name=None,
-                    resolved_at=_now_iso(),
+                    resolved_at=now_iso(),
                     reason="discord_post_failed",
                 ),
             )
@@ -377,10 +377,6 @@ def _format_approval_message(
         sections.append(details)
 
     return clip_text("\n\n".join(sections), APPROVAL_INITIAL_CONTENT_LIMIT)
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def _approval_result_content(
@@ -460,7 +456,7 @@ def _log_approval_request(conversation_key: str, method: str) -> None:
                 "type": "approval_request",
                 "conversation_key": conversation_key,
                 "method": method,
-                "requested_at": _now_iso(),
+                "requested_at": now_iso(),
             },
             ensure_ascii=True,
         ),

@@ -8,7 +8,7 @@ from pathlib import Path
 import discord
 
 from .approval_router import ApprovalRouter
-from .audio_transcriber import OpenAIVoiceTranscriber
+from .audio_transcriber import VoiceTranscriber, make_openai_voice_transcriber
 from .codex_runner import (
     AssistantOutputBlock,
     CodexRunner,
@@ -104,7 +104,7 @@ class DiscordReplyStream:
             self._messages.append(sent)
 
 
-class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attributes
+class CodexDiscordBot(discord.Client):
     """Discord DM client that forwards prompts to a Codex runner."""
 
     def __init__(self, settings: Settings) -> None:
@@ -119,14 +119,13 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
         self._session_store = SessionStore(settings.storage.session_store_path)
         self._conversation_state = ConversationState()
         self._approval_router = ApprovalRouter(
-            timeout_sec=settings.approval_timeout_sec,
+            timeout_sec=settings.discord.approval_timeout_sec,
             messages=self._messages,
         )
-        self._logger = get_logger()
         self._runner: CodexRunner | None = None
-        self._voice_transcriber: OpenAIVoiceTranscriber | None = None
+        self._voice_transcriber: VoiceTranscriber | None = None
         if settings.openai.enable_voice_control and settings.openai.api_key:
-            self._voice_transcriber = OpenAIVoiceTranscriber(
+            self._voice_transcriber = make_openai_voice_transcriber(
                 api_key=settings.openai.api_key,
                 model=settings.openai.transcription_model,
             )
@@ -152,7 +151,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
         user = self.user
         if user is None:
             return
-        self._logger.info(
+        get_logger().info(
             "discord.connected user=%s user_id=%s",
             user,
             user.id,
@@ -163,7 +162,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
         if message.author.bot or message.guild is not None:
             return
 
-        self._logger.debug(
+        get_logger().debug(
             "discord.dm.received message=%r dm_id=%s user_id=%s attachments=%s",
             message.content,
             message.channel.id,
@@ -173,7 +172,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
         content = message.content.strip()
         conversation_key = f"dm:{message.channel.id}"
         if not self._is_whitelisted_user(message.author.id):
-            self._logger.info(
+            get_logger().info(
                 "discord.dm.rejected dm_id=%s user_id=%s reason=not_whitelisted",
                 message.channel.id,
                 message.author.id,
@@ -310,30 +309,9 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
 
         conversation_key = active_turn.conversation_key
         reply_stream = DiscordReplyStream(message, self._messages)
-        model = self._session_store.get_model(
-            conversation_key, self._settings.codex.default_model
-        )
-        cwd = self._session_store.get_cwd(
-            conversation_key, self._settings.codex.workspace_cwd
-        )
-        session_id = self._session_store.get_session_id(conversation_key)
-        session_model = self._session_store.get_session_model(conversation_key)
-        session_cwd = self._session_store.get_session_cwd(conversation_key)
-        request = TurnRequest(
-            context=TurnContext(
-                conversation_key=conversation_key,
-                requester_id=message.author.id,
-                channel=message.channel,
-            ),
-            prompt=prompt,
-            session=SessionContext(
-                model=model,
-                cwd=cwd,
-                session_id=session_id,
-                session_model=session_model,
-                session_cwd=session_cwd,
-            ),
-        )
+        request = self._build_turn_request(message, conversation_key, prompt)
+        model = request.session.model
+        cwd = request.session.cwd
 
         try:
             result = await runner.run_turn(request, active_turn, reply_stream.add_block)
@@ -364,8 +342,39 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
         finally:
             await self._conversation_state.finish(active_turn)
 
+    def _build_turn_request(
+        self,
+        message: discord.Message,
+        conversation_key: str,
+        prompt: str,
+    ) -> TurnRequest:
+        model = self._session_store.get_model(
+            conversation_key, self._settings.codex.default_model
+        )
+        cwd = self._session_store.get_cwd(
+            conversation_key, self._settings.codex.workspace_cwd
+        )
+        session_id = self._session_store.get_session_id(conversation_key)
+        session_model = self._session_store.get_session_model(conversation_key)
+        session_cwd = self._session_store.get_session_cwd(conversation_key)
+        return TurnRequest(
+            context=TurnContext(
+                conversation_key=conversation_key,
+                requester_id=message.author.id,
+                channel=message.channel,
+            ),
+            prompt=prompt,
+            session=SessionContext(
+                model=model,
+                cwd=cwd,
+                session_id=session_id,
+                session_model=session_model,
+                session_cwd=session_cwd,
+            ),
+        )
+
     def _is_whitelisted_user(self, user_id: int) -> bool:
-        whitelisted_users = self._settings.whitelisted_users
+        whitelisted_users = self._settings.discord.whitelisted_users
         return not whitelisted_users or user_id in whitelisted_users
 
     def _resolve_cwd(self, raw_cwd: str) -> str | None:
@@ -393,7 +402,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
 
         transcriber = self._voice_transcriber
         if transcriber is None:
-            self._logger.debug(
+            get_logger().debug(
                 "discord.voice.unavailable dm_id=%s user_id=%s enabled=%s",
                 message.channel.id,
                 message.author.id,
@@ -409,7 +418,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
                 )
             return None
 
-        self._logger.debug(
+        get_logger().debug(
             "discord.voice.detected dm_id=%s user_id=%s attachment_id=%s filename=%s",
             message.channel.id,
             message.author.id,
@@ -417,9 +426,9 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
             voice_attachment.filename,
         )
         try:
-            transcript = await transcriber.transcribe_attachment(voice_attachment)
+            transcript = await transcriber(voice_attachment)
         except RuntimeError as exc:
-            self._logger.exception(
+            get_logger().exception(
                 "discord.voice.transcription.failed dm_id=%s user_id=%s attachment_id=%s",
                 message.channel.id,
                 message.author.id,
@@ -434,7 +443,7 @@ class CodexDiscordBot(discord.Client):  # pylint: disable=too-many-instance-attr
             return None
 
         if not transcript:
-            self._logger.debug(
+            get_logger().debug(
                 "discord.voice.transcription.empty dm_id=%s user_id=%s attachment_id=%s",
                 message.channel.id,
                 message.author.id,
