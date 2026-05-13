@@ -141,6 +141,12 @@ These are plain DM messages, not registered Discord slash commands.
 - The bot only responds to direct messages, not server channels.
 - Working directory changes are intentionally limited to the configured workspace root.
 - Voice messages are not treated as control commands like `/clear`, `/cwd`, or `/model`.
+- `cdbot` uses the vendored `openai-codex` SDK but excludes its transitive
+  `openai-codex-cli-bin` runtime package. The bot always uses the local binary
+  configured by `CDBOT_CODEX_BIN`; keep that binary as close as possible to the
+  vendored SDK version because the Codex app-server protocol changes frequently.
+- Tested Codex versions: `CDBOT_CODEX_BIN=.codex/bin/codex` reports
+  `codex-cli 0.131.0-alpha.9`; vendored `openai-codex` SDK is `0.131.0a4`.
 - On Ubuntu 24.04, you may need `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` so Codex can run bubblewrapped commands without errors. See [Codex issue #17337](https://github.com/openai/codex/issues/17337#issuecomment-4322840642) and [Codex issue #14919](https://github.com/openai/codex/issues/14919).
 
 ## License
