@@ -16,11 +16,11 @@ from typing import Any, Protocol, cast
 from openai_codex import AppServerConfig, AppServerError
 from openai_codex.client import AppServerClient, _resolve_codex_bin
 from openai_codex.models import JsonObject, JsonValue
+from openai_codex.types import ThreadTokenUsageUpdatedNotification
 
 from .approval_router import ApprovalRequest, ApprovalRouter
 from .conversation_state import ActiveTurn
 from .debug_logging import dump_for_log, get_logger, trace
-from .helper import parse_int
 from .localization import Messages, load_default_messages
 from .text import (
     extract_assistant_text,
@@ -794,16 +794,14 @@ def _thread_item_payload(item: object) -> object:
 
 
 def _extract_token_usage_last(payload: object) -> dict[str, int]:
-    token_usage = _payload_value(payload, "token_usage", "tokenUsage")
-    total = _payload_value(token_usage, "total")
-    return _normalize_token_usage(total)
+    if not isinstance(payload, ThreadTokenUsageUpdatedNotification):
+        return {}
 
-
-def _normalize_token_usage(usage_last: object) -> dict[str, int]:
-    cached_input = _int_payload_value(usage_last, "cached_input_tokens", "cachedInputTokens")
-    input_tokens = _int_payload_value(usage_last, "input_tokens", "inputTokens")
-    output_tokens = _int_payload_value(usage_last, "output_tokens", "outputTokens")
-    total_tokens = _int_payload_value(usage_last, "total_tokens", "totalTokens")
+    usage_total = payload.token_usage.total
+    cached_input = usage_total.cached_input_tokens
+    input_tokens = usage_total.input_tokens
+    output_tokens = usage_total.output_tokens
+    total_tokens = usage_total.total_tokens
     if total_tokens <= 0:
         total_tokens = max(input_tokens, cached_input) + output_tokens
     if cached_input <= 0 and input_tokens <= 0 and output_tokens <= 0 and total_tokens <= 0:
@@ -814,22 +812,3 @@ def _normalize_token_usage(usage_last: object) -> dict[str, int]:
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
-
-
-def _int_payload_value(payload: object, *keys: str) -> int:
-    value = _payload_value(payload, *keys)
-    if value is None:
-        return 0
-    return parse_int(value)
-
-
-def _payload_value(payload: object, *keys: str) -> object:
-    if payload is None:
-        return None
-    for key in keys:
-        if isinstance(payload, dict) and key in payload:
-            return payload[key]
-        attr = getattr(payload, key, None)
-        if attr is not None:
-            return attr
-    return None

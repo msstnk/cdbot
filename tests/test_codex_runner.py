@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 from openai_codex import AppServerConfig
+from openai_codex.types import ThreadTokenUsageUpdatedNotification
 
 from bot.approval_router import ApprovalRequest, ApprovalRouter
 from bot.codex_runner import (
@@ -37,6 +38,32 @@ class FakeStatus:
         self.value = value
 
 
+def _token_usage_payload(
+    *,
+    cached_input_tokens: int,
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+) -> ThreadTokenUsageUpdatedNotification:
+    usage = {
+        "cachedInputTokens": cached_input_tokens,
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "reasoningOutputTokens": 0,
+        "totalTokens": total_tokens,
+    }
+    return ThreadTokenUsageUpdatedNotification.model_validate(
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "last": usage,
+                "total": usage,
+            },
+        }
+    )
+
+
 class FakeClient:
     def __init__(self, *, resume_error: bool = False) -> None:
         self.resume_error = resume_error
@@ -59,15 +86,11 @@ class FakeClient:
             ),
             FakeNotification(
                 method="thread/tokenUsage/updated",
-                payload=SimpleNamespace(
-                    token_usage=SimpleNamespace(
-                        total=SimpleNamespace(
-                            cached_input_tokens=10,
-                            input_tokens=20,
-                            output_tokens=30,
-                            total_tokens=50,
-                        )
-                    )
+                payload=_token_usage_payload(
+                    cached_input_tokens=10,
+                    input_tokens=20,
+                    output_tokens=30,
+                    total_tokens=50,
                 ),
             ),
             FakeNotification(
